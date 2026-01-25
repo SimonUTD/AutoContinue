@@ -161,11 +161,12 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
         if silence_duration >= silence_threshold {
             auto_continue_count += 1;
 
-            // 获取红色字符统计（用于诊断）
-            let (total_red, max_consecutive) = runner.get_red_stats();
-            println!("\n[AC] 调试 - 红色字符: 总数={}, 最大连续={} (阈值=5)", total_red, max_consecutive);
+            // 获取统计信息（用于诊断）
+            let (total_diff, total_red, max_consecutive) = runner.get_red_stats();
+            println!("\n[AC] 调试 - 差异={}, 红色={}, 连续={} (需要: 差异>=50 且 连续>=5)",
+                total_diff, total_red, max_consecutive);
 
-            // 检测是否有错误输出（需要至少5个连续红色字符）
+            // 检测是否有错误输出（需要足够多的差异内容和连续红色字符）
             let is_error = runner.has_error_output();
 
             // 根据错误状态选择提示词

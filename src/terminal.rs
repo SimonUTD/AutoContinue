@@ -777,9 +777,11 @@ impl VirtualTerminal {
     ///
     /// 返回 true 表示检测到新增的错误（红色差异内容）
     pub fn has_red_content(&self) -> bool {
-        // 阈值：至少需要 5 个连续的新增红色字符才认为是错误
-        const MIN_RED_CHARS: usize = 5;
+        // 阈值配置
+        const MIN_RED_CHARS: usize = 5;      // 至少需要 5 个连续红色字符
+        const MIN_DIFF_CHARS: usize = 50;    // 差异内容至少需要 50 个字符（排除UI微小刷新）
 
+        let mut total_diff = 0;
         let mut consecutive_red = 0;
         let mut max_consecutive_red = 0;
 
@@ -792,18 +794,26 @@ impl VirtualTerminal {
                 // 检查是否有差异（字符或颜色不同）
                 let is_different = current.ch != baseline.ch || current.fg != baseline.fg;
 
-                if is_different && current.fg.is_red() && current.ch != ' ' {
-                    consecutive_red += 1;
-                    max_consecutive_red = max_consecutive_red.max(consecutive_red);
+                if is_different && current.ch != ' ' {
+                    total_diff += 1;
+
+                    if current.fg.is_red() {
+                        consecutive_red += 1;
+                        max_consecutive_red = max_consecutive_red.max(consecutive_red);
+                    } else {
+                        consecutive_red = 0;
+                    }
                 } else {
                     consecutive_red = 0;
                 }
             }
-            // 换行时重置连续计数（行末和行首不连续）
+            // 换行时重置连续计数
             consecutive_red = 0;
         }
 
-        max_consecutive_red >= MIN_RED_CHARS
+        // 只有当差异内容足够多时，才认为是真正的新输出（而非UI刷新）
+        // 并且需要足够多的连续红色字符
+        total_diff >= MIN_DIFF_CHARS && max_consecutive_red >= MIN_RED_CHARS
     }
 
     /// 获取新增的红色文本（差异法）
@@ -827,8 +837,9 @@ impl VirtualTerminal {
     }
 
     /// 获取红色字符统计信息（差异法，用于调试）
-    /// 返回 (总红色差异字符数, 最大连续红色差异字符数)
-    pub fn get_red_stats(&self) -> (usize, usize) {
+    /// 返回 (总差异字符数, 总红色差异字符数, 最大连续红色差异字符数)
+    pub fn get_red_stats(&self) -> (usize, usize, usize) {
+        let mut total_diff = 0;
         let mut total_red = 0;
         let mut consecutive_red = 0;
         let mut max_consecutive_red = 0;
@@ -840,10 +851,16 @@ impl VirtualTerminal {
 
                 let is_different = current.ch != baseline.ch || current.fg != baseline.fg;
 
-                if is_different && current.fg.is_red() && current.ch != ' ' {
-                    total_red += 1;
-                    consecutive_red += 1;
-                    max_consecutive_red = max_consecutive_red.max(consecutive_red);
+                if is_different && current.ch != ' ' {
+                    total_diff += 1;
+
+                    if current.fg.is_red() {
+                        total_red += 1;
+                        consecutive_red += 1;
+                        max_consecutive_red = max_consecutive_red.max(consecutive_red);
+                    } else {
+                        consecutive_red = 0;
+                    }
                 } else {
                     consecutive_red = 0;
                 }
@@ -851,7 +868,7 @@ impl VirtualTerminal {
             consecutive_red = 0;
         }
 
-        (total_red, max_consecutive_red)
+        (total_diff, total_red, max_consecutive_red)
     }
 
     /// 获取新增内容中所有非默认颜色的调试信息（差异法）
