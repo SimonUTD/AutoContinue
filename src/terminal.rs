@@ -52,7 +52,7 @@ pub enum Color {
 impl Color {
     /// 检查是否为纯红色（错误颜色）
     ///
-    /// 注意：只检测明显的"错误红色"，排除橙色、粉色等渐变色
+    /// 注意：只检测明显的"错误红色"，排除橙色等
     /// 大多数 CLI 工具使用标准 ANSI 红色（31m 或 91m）表示错误
     pub fn is_red(&self) -> bool {
         match self {
@@ -67,11 +67,12 @@ impl Color {
             Color::Palette(n) => {
                 matches!(n, 1 | 9 | 196)
             }
-            // RGB 红色：只检测非常纯的红色
-            // 要求：R 很高(>200)，G 和 B 都很低(<80)
-            // 这样可以排除橙色(255,153,51)、粉色(255,102,102)等
+            // RGB 红色检测：
+            // Claude Code 错误色: Rgb(255, 102, 102) - 需要匹配
+            // 排除橙色: Rgb(255, 153, 51), Rgb(255, 183, 101) - G 较高
+            // 条件：R 很高，G 和 B 都较低（<120），且 G 和 B 接近
             Color::Rgb(r, g, b) => {
-                *r > 200 && *g < 80 && *b < 80
+                *r > 200 && *g < 120 && *b < 120
             }
             Color::Default => false,
         }
@@ -805,7 +806,7 @@ impl VirtualTerminal {
     }
 
     /// 清除新增内容追踪器（在发送提示词后调用）
-    /// 同时重置颜色状态，避免残留的红色状态影响后续检测
+    /// 同时重置颜色和解析器状态，避免残留状态影响后续检测
     pub fn clear_new_content(&mut self) {
         self.new_content.clear();
         self.has_new_content = false;
@@ -813,6 +814,8 @@ impl VirtualTerminal {
         self.current_fg = Color::Default;
         self.current_bg = Color::Default;
         self.current_bold = false;
+        // 重置解析器状态，避免中间状态影响后续解析
+        self.reset_parser();
     }
 
     /// 检查是否有新内容
@@ -839,13 +842,16 @@ mod tests {
         assert!(Color::Ansi(1).is_red());
         assert!(Color::Ansi(9).is_red());
         assert!(!Color::Ansi(2).is_red());
+        // Claude Code 错误红色
+        assert!(Color::Rgb(255, 102, 102).is_red());
         // 纯红色 RGB
         assert!(Color::Rgb(255, 0, 0).is_red());
         assert!(Color::Rgb(220, 30, 30).is_red());
-        // 橙色、粉色不是红色
-        assert!(!Color::Rgb(255, 153, 51).is_red());  // 橙色
-        assert!(!Color::Rgb(255, 102, 102).is_red()); // 粉色
-        assert!(!Color::Rgb(50, 200, 50).is_red());   // 绿色
+        // 橙色不是红色
+        assert!(!Color::Rgb(255, 153, 51).is_red());
+        assert!(!Color::Rgb(255, 183, 101).is_red());
+        // 绿色不是红色
+        assert!(!Color::Rgb(50, 200, 50).is_red());
     }
 
     #[test]
