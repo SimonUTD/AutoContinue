@@ -195,13 +195,13 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
                 println!("\n[AC] === 静默 {} 秒，检测到错误输出，自动发送第 {} 次{}提示词 ===",
                     silence_duration.as_secs(), auto_continue_count, prompt_type);
                 if !error_content.is_empty() {
-                    // 截断过长的错误内容
-                    let display_content = if error_content.len() > 50 {
-                        format!("{}...", &error_content[..50])
+                    // 截断过长的错误内容（使用字符而非字节，避免UTF-8截断问题）
+                    let display_content: String = error_content.chars().take(50).collect();
+                    if error_content.chars().count() > 50 {
+                        println!("[AC] 错误内容: {}...", display_content);
                     } else {
-                        error_content
-                    };
-                    println!("[AC] 错误内容: {}", display_content);
+                        println!("[AC] 错误内容: {}", display_content);
+                    }
                 }
             } else {
                 println!("\n[AC] === 静默 {} 秒，自动发送第 {} 次{}提示词 ===",
