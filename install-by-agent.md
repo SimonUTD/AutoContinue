@@ -14,7 +14,7 @@ Download pre-built binaries from GitHub Releases:
 ### For Windows (x64):
 ```powershell
 # Download and extract
-Invoke-WebRequest -Uri "https://github.com/MoYeRanQianZhi/AutoContinue/releases/latest/download/ac-latest-x86_64-pc-windows-msvc.zip" -OutFile ac.zip
+Invoke-WebRequest -Uri "https://github.com/MoYeRanQianZhi/AutoContinue/releases/latest/download/ac-vX.X.Xx86_64-pc-windows-msvc.zip" -OutFile ac.zip
 Expand-Archive ac.zip -DestinationPath .
 Copy-Item ac.exe $env:USERPROFILE\.cargo\bin\
 Remove-Item ac.zip
@@ -23,29 +23,29 @@ Remove-Item ac.zip
 ### For Linux (x64):
 ```bash
 # Download and extract
-curl -LO https://github.com/MoYeRanQianZhi/AutoContinue/releases/latest/download/ac-latest-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf ac-latest-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/MoYeRanQianZhi/AutoContinue/releases/latest/download/ac-vX.X.Xx86_64-unknown-linux-gnu.tar.gz
+tar -xzf ac-vX.X.Xx86_64-unknown-linux-gnu.tar.gz
 sudo cp ac /usr/local/bin/
 chmod +x /usr/local/bin/ac
-rm ac-latest-x86_64-unknown-linux-gnu.tar.gz
+rm ac-vX.X.Xx86_64-unknown-linux-gnu.tar.gz
 ```
 
 ### For macOS (Intel x64):
 ```bash
-curl -LO https://github.com/MoYeRanQianZhi/AutoContinue/releases/latest/download/ac-latest-x86_64-apple-darwin.tar.gz
-tar -xzf ac-latest-x86_64-apple-darwin.tar.gz
+curl -LO https://github.com/MoYeRanQianZhi/AutoContinue/releases/latest/download/ac-vX.X.Xx86_64-apple-darwin.tar.gz
+tar -xzf ac-vX.X.Xx86_64-apple-darwin.tar.gz
 sudo cp ac /usr/local/bin/
 chmod +x /usr/local/bin/ac
-rm ac-latest-x86_64-apple-darwin.tar.gz
+rm ac-vX.X.Xx86_64-apple-darwin.tar.gz
 ```
 
 ### For macOS (Apple Silicon ARM64):
 ```bash
-curl -LO https://github.com/MoYeRanQianZhi/AutoContinue/releases/latest/download/ac-latest-aarch64-apple-darwin.tar.gz
-tar -xzf ac-latest-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/MoYeRanQianZhi/AutoContinue/releases/latest/download/ac-vX.X.Xaarch64-apple-darwin.tar.gz
+tar -xzf ac-vX.X.Xaarch64-apple-darwin.tar.gz
 sudo cp ac /usr/local/bin/
 chmod +x /usr/local/bin/ac
-rm ac-latest-aarch64-apple-darwin.tar.gz
+rm ac-vX.X.Xaarch64-apple-darwin.tar.gz
 ```
 
 ---
