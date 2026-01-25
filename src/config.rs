@@ -136,17 +136,29 @@ impl Config {
 /// - `path`: 提示词文件路径
 ///
 /// # 返回值
-/// 成功返回文件内容（去除首尾空白），失败返回错误
+/// 成功返回文件内容（去除首尾空白，标准化换行符），失败返回错误
 ///
 /// # 错误
 /// - 文件不存在
 /// - 文件无法读取
+///
+/// # 注意
+/// 该函数会标准化换行符：
+/// - Windows换行符 `\r\n` 会被转换为 `\n`
+/// - 单独的 `\r` 也会被转换为 `\n`
+/// 这确保了跨平台的一致行为
 fn load_prompt_from_file<P: AsRef<Path>>(path: P) -> Result<String> {
     let content = fs::read_to_string(path.as_ref())
         .with_context(|| "读取文件失败")?;
 
+    // 标准化换行符：将 \r\n 和单独的 \r 都转换为 \n
+    // 这样可以避免在PTY中换行被重复处理
+    let normalized = content
+        .replace("\r\n", "\n")  // Windows换行符 -> Unix换行符
+        .replace("\r", "\n");   // 旧Mac换行符 -> Unix换行符
+
     // 去除首尾空白字符
-    Ok(content.trim().to_string())
+    Ok(normalized.trim().to_string())
 }
 
 impl Default for Config {
@@ -181,6 +193,36 @@ mod tests {
         // 加载并验证
         let prompt = load_prompt_from_file(file.path())?;
         assert_eq!(prompt, "测试提示词");
+
+        Ok(())
+    }
+
+    /// 测试换行符标准化（Windows格式 \r\n）
+    #[test]
+    fn test_normalize_crlf() -> Result<()> {
+        let mut file = NamedTempFile::new()?;
+        // 写入Windows格式换行符
+        file.write_all(b"Line1\r\nLine2\r\nLine3")?;
+
+        let prompt = load_prompt_from_file(file.path())?;
+        // 应该只有 \n，没有 \r
+        assert!(!prompt.contains('\r'));
+        assert_eq!(prompt, "Line1\nLine2\nLine3");
+
+        Ok(())
+    }
+
+    /// 测试换行符标准化（单独的 \r）
+    #[test]
+    fn test_normalize_cr() -> Result<()> {
+        let mut file = NamedTempFile::new()?;
+        // 写入旧Mac格式换行符
+        file.write_all(b"Line1\rLine2\rLine3")?;
+
+        let prompt = load_prompt_from_file(file.path())?;
+        // \r 应该被转换为 \n
+        assert!(!prompt.contains('\r'));
+        assert_eq!(prompt, "Line1\nLine2\nLine3");
 
         Ok(())
     }
