@@ -131,8 +131,8 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
                 monitor.set_running_flag(runner.get_running_flag());
                 monitor.set_running();
 
-                // 启动IO转发
-                let io_handle = runner.start_io_forwarding()?;
+                // 启动双向IO转发（stdout和stdin）
+                let io_handles = runner.start_io_forwarding()?;
 
                 // 如果有待发送的提示词，发送它
                 if let Some(ref prompt) = pending_prompt {
@@ -148,10 +148,10 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
                 // 监控进程状态
                 let exit_status = monitor_process(&mut runner, &mut monitor, &exit_flag)?;
 
-                // 等待IO线程结束（不阻塞等待，因为PTY读取可能会阻塞）
+                // 停止IO转发并恢复终端模式
                 runner.stop();
                 // 不等待IO线程，让它自然结束
-                drop(io_handle);
+                drop(io_handles);
 
                 // 如果需要退出，跳出循环
                 if monitor.should_exit() {

@@ -4,7 +4,7 @@
 //!
 //! ## 功能
 //! - 使用portable-pty启动CLI进程
-//! - 保持stdin/stdout的完整传递
+//! - 双向IO转发：stdin -> PTY，PTY -> stdout
 //! - 确保用户可以正常操作CLI
 //! - 支持向CLI发送输入（提示词）
 //!
@@ -13,12 +13,24 @@
 //! - Unix/Linux/macOS: 使用传统PTY
 
 use anyhow::{Context, Result};
+use crossterm::terminal;
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+/// IO转发线程句柄
+///
+/// 包含输出和输入转发线程的句柄
+#[allow(dead_code)]
+pub struct IoHandles {
+    /// 输出转发线程句柄（PTY -> stdout）
+    pub output_handle: thread::JoinHandle<()>,
+    /// 输入转发线程句柄（stdin -> PTY）
+    pub input_handle: thread::JoinHandle<()>,
+}
 
 /// CLI运行器
 ///
@@ -28,8 +40,8 @@ pub struct Runner {
     /// PTY pair（主端和从端）
     pty_pair: PtyPair,
 
-    /// PTY写入器，用于向CLI发送输入
-    writer: Box<dyn Write + Send>,
+    /// PTY写入器，用于向CLI发送输入（共享，用于多线程访问）
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
 
     /// 子进程句柄
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -64,7 +76,7 @@ impl Runner {
         let pty_system = native_pty_system();
 
         // 获取终端大小，如果失败则使用默认值
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
 
         // 创建PTY对，指定终端大小
         let pair = pty_system
@@ -97,25 +109,27 @@ impl Runner {
 
         Ok(Runner {
             pty_pair: pair,
-            writer,
+            writer: Arc::new(Mutex::new(writer)),
             child,
             running,
             exit_status,
         })
     }
 
-    /// 启动IO转发线程
+    /// 启动双向IO转发线程
     ///
-    /// 该方法启动后台线程，将PTY的输出转发到stdout，
-    /// 将stdin转发到PTY，实现完整的交互性。
-    ///
-    /// # 参数
-    /// - `running`: 共享的运行状态标志
+    /// 该方法启动两个后台线程：
+    /// 1. 输出转发：PTY -> stdout（显示CLI输出）
+    /// 2. 输入转发：stdin -> PTY（用户输入到CLI）
     ///
     /// # 返回值
-    /// 返回输出转发线程的句柄
-    pub fn start_io_forwarding(&mut self) -> Result<thread::JoinHandle<()>> {
-        let running = self.running.clone();
+    /// 返回包含两个线程句柄的IoHandles结构
+    pub fn start_io_forwarding(&mut self) -> Result<IoHandles> {
+        // 启用终端原始模式，以便直接获取用户输入
+        let _ = terminal::enable_raw_mode();
+
+        let running_output = self.running.clone();
+        let running_input = self.running.clone();
 
         // 获取PTY读取器
         let mut reader = self
@@ -124,12 +138,15 @@ impl Runner {
             .try_clone_reader()
             .context("无法克隆PTY读取器")?;
 
+        // 获取PTY写入器的共享引用
+        let writer = self.writer.clone();
+
         // 启动输出转发线程：PTY -> stdout
         let output_handle = thread::spawn(move || {
             let mut stdout = std::io::stdout();
             let mut buffer = [0u8; 4096];
 
-            while running.load(Ordering::SeqCst) {
+            while running_output.load(Ordering::SeqCst) {
                 match reader.read(&mut buffer) {
                     Ok(0) => {
                         // EOF，进程已结束
@@ -154,7 +171,52 @@ impl Runner {
             }
         });
 
-        Ok(output_handle)
+        // 启动输入转发线程：stdin -> PTY
+        let input_handle = thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buffer = [0u8; 1024];
+
+            while running_input.load(Ordering::SeqCst) {
+                // 使用crossterm的event poll来非阻塞检测输入
+                match crossterm::event::poll(Duration::from_millis(50)) {
+                    Ok(true) => {
+                        // 有事件可读，尝试读取stdin
+                        match stdin.read(&mut buffer) {
+                            Ok(0) => {
+                                // EOF
+                                break;
+                            }
+                            Ok(n) => {
+                                // 将数据写入PTY
+                                if let Ok(mut w) = writer.lock() {
+                                    if w.write_all(&buffer[..n]).is_err() {
+                                        break;
+                                    }
+                                    let _ = w.flush();
+                                }
+                            }
+                            Err(e) => {
+                                if e.kind() != std::io::ErrorKind::WouldBlock {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        // 没有事件，继续循环
+                    }
+                    Err(_) => {
+                        // poll出错，短暂休眠后继续
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        });
+
+        Ok(IoHandles {
+            output_handle,
+            input_handle,
+        })
     }
 
     /// 向CLI发送输入
@@ -170,13 +232,15 @@ impl Runner {
     /// runner.send_input("继续\n")?;
     /// ```
     pub fn send_input(&mut self, input: &str) -> Result<()> {
+        let mut writer = self.writer.lock().map_err(|_| anyhow::anyhow!("无法获取写入器锁"))?;
+
         // 写入输入
-        self.writer
+        writer
             .write_all(input.as_bytes())
             .context("无法向CLI发送输入")?;
 
         // 确保数据被刷新
-        self.writer.flush().context("无法刷新输入缓冲区")?;
+        writer.flush().context("无法刷新输入缓冲区")?;
 
         Ok(())
     }
@@ -245,11 +309,13 @@ impl Runner {
         self.running.clone()
     }
 
-    /// 停止运行标志
+    /// 停止运行标志并恢复终端模式
     ///
     /// 设置运行标志为false，通知所有相关线程停止
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        // 恢复终端模式
+        let _ = terminal::disable_raw_mode();
     }
 }
 
