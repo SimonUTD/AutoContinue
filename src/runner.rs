@@ -175,7 +175,7 @@ impl Runner {
     ///
     /// 每次有输入或输出时，都会更新最后活动时间。
     /// 输出数据同时被送入虚拟终端进行解析和错误检测。
-    /// 自动检测子进程是否启用鼠标模式，只有启用时才转发鼠标事件。
+    /// 自动检测子进程是否启用鼠标模式，动态启用/禁用鼠标捕获。
     ///
     /// # 返回值
     /// 返回包含两个线程句柄的IoHandles结构
@@ -183,12 +183,8 @@ impl Runner {
         // 启用终端原始模式，以便直接获取用户输入
         let _ = terminal::enable_raw_mode();
 
-        // 启用鼠标捕获，以便能够接收鼠标事件
-        // 但只有当子进程启用鼠标模式时才转发
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::event::EnableMouseCapture
-        );
+        // 不在这里启用鼠标捕获，等待子进程请求时再启用
+        // 这样滚轮等功能在子进程不需要鼠标时仍然可以正常工作
 
         let running_output = self.running.clone();
         let running_input = self.running.clone();
@@ -221,10 +217,11 @@ impl Runner {
 
         // 启动输出转发线程：PTY -> stdout + 虚拟终端 + 鼠标模式检测
         // 每次有输出时更新最后活动时间，并送入虚拟终端处理
-        // 检测鼠标模式启用/禁用序列
+        // 检测鼠标模式启用/禁用序列，动态控制鼠标捕获
         let output_handle = thread::spawn(move || {
             let mut stdout = std::io::stdout();
             let mut buffer = [0u8; 4096];
+            let mut mouse_capture_enabled = false;
 
             while running_output.load(Ordering::SeqCst) {
                 match reader.read(&mut buffer) {
@@ -239,7 +236,25 @@ impl Runner {
                         }
 
                         // 检测鼠标模式启用/禁用序列
-                        detect_mouse_mode(&buffer[..n], &mouse_mode_output);
+                        let mouse_mode_changed = detect_mouse_mode(&buffer[..n], &mouse_mode_output);
+
+                        // 根据鼠标模式状态动态启用/禁用鼠标捕获
+                        if mouse_mode_changed {
+                            let should_enable = mouse_mode_output.load(Ordering::SeqCst);
+                            if should_enable && !mouse_capture_enabled {
+                                let _ = crossterm::execute!(
+                                    stdout,
+                                    crossterm::event::EnableMouseCapture
+                                );
+                                mouse_capture_enabled = true;
+                            } else if !should_enable && mouse_capture_enabled {
+                                let _ = crossterm::execute!(
+                                    stdout,
+                                    crossterm::event::DisableMouseCapture
+                                );
+                                mouse_capture_enabled = false;
+                            }
+                        }
 
                         // 将数据送入虚拟终端处理（用于错误检测）
                         if let Ok(mut term) = terminal.lock() {
@@ -262,12 +277,20 @@ impl Runner {
                     }
                 }
             }
+
+            // 退出时确保禁用鼠标捕获
+            if mouse_capture_enabled {
+                let _ = crossterm::execute!(
+                    stdout,
+                    crossterm::event::DisableMouseCapture
+                );
+            }
         });
 
         // 启动输入转发线程：stdin -> PTY
         // 使用crossterm的event系统正确处理特殊键（方向键、ESC等）
         // 每次有输入时更新最后活动时间
-        // 只有在鼠标模式启用时才转发鼠标事件
+        // 鼠标事件直接转发（因为只有在子进程启用鼠标模式时才会收到）
         let input_handle = thread::spawn(move || {
             while running_input.load(Ordering::SeqCst) {
                 // 首先检查是否有注入的输入
@@ -461,11 +484,7 @@ impl Runner {
     /// 设置运行标志为false，通知所有相关线程停止
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-        // 禁用鼠标捕获
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::event::DisableMouseCapture
-        );
+        // 鼠标捕获由输出线程在退出时自动禁用
         // 恢复终端模式
         let _ = terminal::disable_raw_mode();
     }
@@ -480,7 +499,10 @@ impl Runner {
 /// # 参数
 /// - `data`: 输出数据
 /// - `mouse_mode`: 鼠标模式标志
-fn detect_mouse_mode(data: &[u8], mouse_mode: &AtomicBool) {
+///
+/// # 返回值
+/// 如果鼠标模式状态发生变化返回 true
+fn detect_mouse_mode(data: &[u8], mouse_mode: &AtomicBool) -> bool {
     // 鼠标模式启用序列
     const MOUSE_ENABLE_PATTERNS: &[&[u8]] = &[
         b"\x1b[?1000h",  // X10 鼠标模式
@@ -497,21 +519,31 @@ fn detect_mouse_mode(data: &[u8], mouse_mode: &AtomicBool) {
         b"\x1b[?1006l",
     ];
 
+    let current_state = mouse_mode.load(Ordering::SeqCst);
+
     // 检测启用序列
     for pattern in MOUSE_ENABLE_PATTERNS {
         if contains_subsequence(data, pattern) {
-            mouse_mode.store(true, Ordering::SeqCst);
-            return;
+            if !current_state {
+                mouse_mode.store(true, Ordering::SeqCst);
+                return true;
+            }
+            return false;
         }
     }
 
     // 检测禁用序列
     for pattern in MOUSE_DISABLE_PATTERNS {
         if contains_subsequence(data, pattern) {
-            mouse_mode.store(false, Ordering::SeqCst);
-            return;
+            if current_state {
+                mouse_mode.store(false, Ordering::SeqCst);
+                return true;
+            }
+            return false;
         }
     }
+
+    false
 }
 
 /// 检查数据中是否包含指定的子序列
