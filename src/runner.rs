@@ -13,6 +13,7 @@
 //! - Unix/Linux/macOS: 使用传统PTY
 
 use anyhow::{Context, Result};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use std::io::{Read, Write};
@@ -186,39 +187,35 @@ impl Runner {
         });
 
         // 启动输入转发线程：stdin -> PTY
+        // 使用crossterm的event系统正确处理特殊键（方向键、ESC等）
         // 每次有输入时更新最后活动时间
         let input_handle = thread::spawn(move || {
-            let mut stdin = std::io::stdin();
-            let mut buffer = [0u8; 1024];
-
             while running_input.load(Ordering::SeqCst) {
                 // 使用crossterm的event poll来非阻塞检测输入
                 match crossterm::event::poll(Duration::from_millis(50)) {
                     Ok(true) => {
-                        // 有事件可读，尝试读取stdin
-                        match stdin.read(&mut buffer) {
-                            Ok(0) => {
-                                // EOF
-                                break;
-                            }
-                            Ok(n) => {
-                                // 更新最后活动时间（有输入）
-                                if let Ok(mut time) = last_activity_input.lock() {
-                                    *time = Instant::now();
-                                }
-
-                                // 将数据写入PTY
-                                if let Ok(mut w) = writer.lock() {
-                                    if w.write_all(&buffer[..n]).is_err() {
-                                        break;
+                        // 有事件可读，使用crossterm读取事件
+                        match crossterm::event::read() {
+                            Ok(event) => {
+                                // 将事件转换为字节序列
+                                if let Some(bytes) = event_to_bytes(&event) {
+                                    // 更新最后活动时间（有输入）
+                                    if let Ok(mut time) = last_activity_input.lock() {
+                                        *time = Instant::now();
                                     }
-                                    let _ = w.flush();
+
+                                    // 将数据写入PTY
+                                    if let Ok(mut w) = writer.lock() {
+                                        if w.write_all(&bytes).is_err() {
+                                            break;
+                                        }
+                                        let _ = w.flush();
+                                    }
                                 }
                             }
-                            Err(e) => {
-                                if e.kind() != std::io::ErrorKind::WouldBlock {
-                                    break;
-                                }
+                            Err(_) => {
+                                // 读取事件出错，短暂休眠后继续
+                                thread::sleep(Duration::from_millis(10));
                             }
                         }
                     }
@@ -265,15 +262,19 @@ impl Runner {
         Ok(())
     }
 
-    /// 向CLI发送一行输入（自动添加换行符）
+    /// 向CLI发送一行输入（自动添加回车符）
     ///
     /// # 参数
     /// - `line`: 要发送的输入行
     ///
     /// # 返回值
     /// 成功返回Ok(())，失败返回错误
+    ///
+    /// # 注意
+    /// 使用 \r（回车符）而不是 \n（换行符），因为终端模拟中
+    /// 按下Enter键发送的是回车符
     pub fn send_line(&mut self, line: &str) -> Result<()> {
-        let input = format!("{}\n", line);
+        let input = format!("{}\r", line);
         self.send_input(&input)
     }
 
@@ -369,6 +370,113 @@ impl Runner {
 /// 如果退出码为0返回true，否则返回false
 pub fn is_success(status: &portable_pty::ExitStatus) -> bool {
     status.success()
+}
+
+/// 将crossterm事件转换为PTY可接受的字节序列
+///
+/// 该函数处理键盘事件，将特殊键（方向键、功能键等）转换为
+/// 相应的ANSI转义序列，普通字符直接转换为UTF-8字节。
+///
+/// # 参数
+/// - `event`: crossterm事件
+///
+/// # 返回值
+/// 如果是键盘事件，返回对应的字节序列；否则返回None
+fn event_to_bytes(event: &Event) -> Option<Vec<u8>> {
+    match event {
+        Event::Key(key_event) => key_event_to_bytes(key_event),
+        Event::Paste(text) => {
+            // 粘贴事件，直接返回文本的UTF-8字节
+            Some(text.as_bytes().to_vec())
+        }
+        _ => None, // 忽略其他事件（鼠标、窗口大小变化等）
+    }
+}
+
+/// 将键盘事件转换为字节序列
+///
+/// # 参数
+/// - `key_event`: 键盘事件
+///
+/// # 返回值
+/// 返回对应的字节序列
+fn key_event_to_bytes(key_event: &KeyEvent) -> Option<Vec<u8>> {
+    let KeyEvent { code, modifiers, .. } = key_event;
+
+    // 处理Ctrl组合键
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        return match code {
+            // 特殊的Ctrl组合键
+            KeyCode::Char('[') => Some(vec![0x1B]), // Ctrl+[ = ESC
+            KeyCode::Char('\\') => Some(vec![0x1C]),
+            KeyCode::Char(']') => Some(vec![0x1D]),
+            KeyCode::Char('^') => Some(vec![0x1E]),
+            KeyCode::Char('_') => Some(vec![0x1F]),
+            // Ctrl+A 到 Ctrl+Z 映射到 0x01 到 0x1A
+            KeyCode::Char(c) => {
+                let ctrl_char = (*c as u8).to_ascii_lowercase();
+                if ctrl_char >= b'a' && ctrl_char <= b'z' {
+                    Some(vec![ctrl_char - b'a' + 1])
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+    }
+
+    // 处理普通键和特殊键
+    match code {
+        // 普通字符
+        KeyCode::Char(c) => Some(c.to_string().into_bytes()),
+
+        // 回车键 - 发送 \r（重要：不是 \n）
+        KeyCode::Enter => Some(vec![b'\r']),
+
+        // 退格键
+        KeyCode::Backspace => Some(vec![0x7F]), // DEL
+
+        // Tab键
+        KeyCode::Tab => Some(vec![b'\t']),
+
+        // ESC键
+        KeyCode::Esc => Some(vec![0x1B]),
+
+        // 方向键（ANSI转义序列）
+        KeyCode::Up => Some(vec![0x1B, b'[', b'A']),
+        KeyCode::Down => Some(vec![0x1B, b'[', b'B']),
+        KeyCode::Right => Some(vec![0x1B, b'[', b'C']),
+        KeyCode::Left => Some(vec![0x1B, b'[', b'D']),
+
+        // Home/End键
+        KeyCode::Home => Some(vec![0x1B, b'[', b'H']),
+        KeyCode::End => Some(vec![0x1B, b'[', b'F']),
+
+        // Insert/Delete键
+        KeyCode::Insert => Some(vec![0x1B, b'[', b'2', b'~']),
+        KeyCode::Delete => Some(vec![0x1B, b'[', b'3', b'~']),
+
+        // Page Up/Down键
+        KeyCode::PageUp => Some(vec![0x1B, b'[', b'5', b'~']),
+        KeyCode::PageDown => Some(vec![0x1B, b'[', b'6', b'~']),
+
+        // 功能键 F1-F12
+        KeyCode::F(1) => Some(vec![0x1B, b'O', b'P']),
+        KeyCode::F(2) => Some(vec![0x1B, b'O', b'Q']),
+        KeyCode::F(3) => Some(vec![0x1B, b'O', b'R']),
+        KeyCode::F(4) => Some(vec![0x1B, b'O', b'S']),
+        KeyCode::F(5) => Some(vec![0x1B, b'[', b'1', b'5', b'~']),
+        KeyCode::F(6) => Some(vec![0x1B, b'[', b'1', b'7', b'~']),
+        KeyCode::F(7) => Some(vec![0x1B, b'[', b'1', b'8', b'~']),
+        KeyCode::F(8) => Some(vec![0x1B, b'[', b'1', b'9', b'~']),
+        KeyCode::F(9) => Some(vec![0x1B, b'[', b'2', b'0', b'~']),
+        KeyCode::F(10) => Some(vec![0x1B, b'[', b'2', b'1', b'~']),
+        KeyCode::F(11) => Some(vec![0x1B, b'[', b'2', b'3', b'~']),
+        KeyCode::F(12) => Some(vec![0x1B, b'[', b'2', b'4', b'~']),
+
+        // 其他未处理的键
+        _ => None,
+    }
 }
 
 #[cfg(test)]
