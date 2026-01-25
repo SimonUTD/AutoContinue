@@ -5,6 +5,7 @@
 //! ## 功能特性
 //! - 自动检测CLI静默状态（无输入/输出）
 //! - 静默超过阈值时自动发送继续提示词
+//! - 检测错误输出（红色文本）自动发送重试提示词
 //! - 保持CLI的完整交互性，用户可正常操作
 //! - 任何输入/输出都会重置静默计时器
 //! - Ctrl+C优雅退出
@@ -18,6 +19,7 @@ mod args;
 mod config;
 mod monitor;
 mod runner;
+mod terminal;
 
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -159,23 +161,56 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
         if silence_duration >= silence_threshold {
             auto_continue_count += 1;
 
-            // 获取当前的继续提示词（IO模式会重新读取文件）
-            let prompt = match config.get_continue_prompt() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("[AC] 获取继续提示词失败: {}", e);
-                    continue;
+            // 检测是否有错误输出（红色文本）
+            let is_error = runner.has_error_output();
+
+            // 根据错误状态选择提示词
+            let (prompt, prompt_type) = if is_error {
+                // 检测到错误，使用重试提示词
+                match config.get_retry_prompt() {
+                    Ok(p) => (p, "重试"),
+                    Err(e) => {
+                        eprintln!("[AC] 获取重试提示词失败: {}", e);
+                        continue;
+                    }
+                }
+            } else {
+                // 正常状态，使用继续提示词
+                match config.get_continue_prompt() {
+                    Ok(p) => (p, "继续"),
+                    Err(e) => {
+                        eprintln!("[AC] 获取继续提示词失败: {}", e);
+                        continue;
+                    }
                 }
             };
 
-            // 发送继续提示词
-            println!("\n[AC] === 静默 {} 秒，自动发送第 {} 次继续提示词 ===",
-                silence_duration.as_secs(), auto_continue_count);
+            // 发送提示词
+            if is_error {
+                let error_content = runner.get_error_content();
+                println!("\n[AC] === 静默 {} 秒，检测到错误输出，自动发送第 {} 次{}提示词 ===",
+                    silence_duration.as_secs(), auto_continue_count, prompt_type);
+                if !error_content.is_empty() {
+                    // 截断过长的错误内容
+                    let display_content = if error_content.len() > 50 {
+                        format!("{}...", &error_content[..50])
+                    } else {
+                        error_content
+                    };
+                    println!("[AC] 错误内容: {}", display_content);
+                }
+            } else {
+                println!("\n[AC] === 静默 {} 秒，自动发送第 {} 次{}提示词 ===",
+                    silence_duration.as_secs(), auto_continue_count, prompt_type);
+            }
             println!("[AC] 发送: {}", prompt);
 
             if let Err(e) = runner.send_line(&prompt) {
                 eprintln!("[AC] 发送提示词失败: {}", e);
             }
+
+            // 清除错误检测状态，准备下一轮检测
+            runner.clear_error_state();
 
             // 发送后活动时间会自动更新（在send_input中）
             // 不需要手动重置
@@ -188,7 +223,7 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
     // 停止IO转发并恢复终端模式
     runner.stop();
 
-    println!("[AC] 共自动发送了 {} 次继续提示词", auto_continue_count);
+    println!("[AC] 共自动发送了 {} 次提示词", auto_continue_count);
 
     Ok(())
 }

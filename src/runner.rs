@@ -6,6 +6,7 @@
 //! - 使用portable-pty启动CLI进程
 //! - 双向IO转发：stdin -> PTY，PTY -> stdout
 //! - 跟踪最后活动时间（输入/输出）用于静默检测
+//! - 虚拟终端追踪输出内容，用于错误检测
 //! - 确保用户可以正常操作CLI
 //!
 //! ## 跨平台支持
@@ -23,6 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::terminal::{SharedTerminal, create_shared_terminal};
+
 /// IO转发线程句柄
 ///
 /// 包含输出和输入转发线程的句柄
@@ -39,6 +42,7 @@ pub struct IoHandles {
 /// 负责启动CLI进程并管理其生命周期。
 /// 使用PTY来保持CLI的完整交互性。
 /// 跟踪最后活动时间用于静默检测。
+/// 使用虚拟终端追踪输出内容用于错误检测。
 pub struct Runner {
     /// PTY pair（主端和从端）
     pty_pair: PtyPair,
@@ -62,6 +66,15 @@ pub struct Runner {
     /// 用于注入输入到输入线程的 channel（发送端）
     /// 通过这个 channel 发送的数据会被输入线程当作用户输入处理
     inject_sender: Option<Sender<Vec<u8>>>,
+
+    /// 虚拟终端，用于追踪输出内容和检测错误
+    terminal: SharedTerminal,
+
+    /// 终端宽度
+    terminal_width: usize,
+
+    /// 终端高度
+    terminal_height: usize,
 }
 
 impl Runner {
@@ -83,6 +96,8 @@ impl Runner {
 
         // 获取终端大小，如果失败则使用默认值
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let terminal_width = cols as usize;
+        let terminal_height = rows as usize;
 
         // 创建PTY对，指定终端大小
         let pair = pty_system
@@ -129,6 +144,9 @@ impl Runner {
         let exit_status = Arc::new(Mutex::new(None));
         let last_activity_time = Arc::new(Mutex::new(Instant::now()));
 
+        // 创建虚拟终端用于追踪输出和检测错误
+        let terminal = create_shared_terminal(terminal_width, terminal_height);
+
         Ok(Runner {
             pty_pair: pair,
             writer: Arc::new(Mutex::new(writer)),
@@ -137,16 +155,20 @@ impl Runner {
             exit_status,
             last_activity_time,
             inject_sender: None,
+            terminal,
+            terminal_width,
+            terminal_height,
         })
     }
 
     /// 启动双向IO转发线程
     ///
     /// 该方法启动两个后台线程：
-    /// 1. 输出转发：PTY -> stdout（显示CLI输出）
+    /// 1. 输出转发：PTY -> stdout（显示CLI输出）+ 虚拟终端处理
     /// 2. 输入转发：stdin -> PTY（用户输入到CLI）
     ///
     /// 每次有输入或输出时，都会更新最后活动时间。
+    /// 输出数据同时被送入虚拟终端进行解析和错误检测。
     ///
     /// # 返回值
     /// 返回包含两个线程句柄的IoHandles结构
@@ -176,8 +198,11 @@ impl Runner {
         let (inject_tx, inject_rx) = mpsc::channel::<Vec<u8>>();
         self.inject_sender = Some(inject_tx);
 
-        // 启动输出转发线程：PTY -> stdout
-        // 每次有输出时更新最后活动时间
+        // 获取虚拟终端的共享引用
+        let terminal = self.terminal.clone();
+
+        // 启动输出转发线程：PTY -> stdout + 虚拟终端
+        // 每次有输出时更新最后活动时间，并送入虚拟终端处理
         let output_handle = thread::spawn(move || {
             let mut stdout = std::io::stdout();
             let mut buffer = [0u8; 4096];
@@ -192,6 +217,11 @@ impl Runner {
                         // 更新最后活动时间（有输出）
                         if let Ok(mut time) = last_activity_output.lock() {
                             *time = Instant::now();
+                        }
+
+                        // 将数据送入虚拟终端处理（用于错误检测）
+                        if let Ok(mut term) = terminal.lock() {
+                            term.process(&buffer[..n]);
                         }
 
                         // 将数据写入stdout
@@ -396,6 +426,45 @@ impl Runner {
     /// 返回运行状态的Arc引用
     pub fn get_running_flag(&self) -> Arc<AtomicBool> {
         self.running.clone()
+    }
+
+    /// 检查输出中是否包含红色文本（错误检测）
+    ///
+    /// 通过虚拟终端分析自上次检查以来的新增输出，
+    /// 判断是否包含红色文本，用于区分正常结束和错误状态。
+    ///
+    /// # 返回值
+    /// 如果检测到红色文本返回 true，表示可能是错误
+    pub fn has_error_output(&self) -> bool {
+        if let Ok(term) = self.terminal.lock() {
+            term.has_red_content()
+        } else {
+            false
+        }
+    }
+
+    /// 获取错误输出内容
+    ///
+    /// 返回虚拟终端中检测到的红色文本内容
+    ///
+    /// # 返回值
+    /// 红色文本内容字符串
+    pub fn get_error_content(&self) -> String {
+        if let Ok(term) = self.terminal.lock() {
+            term.get_red_content()
+        } else {
+            String::new()
+        }
+    }
+
+    /// 清除错误检测状态
+    ///
+    /// 在发送提示词后调用，重置新增内容追踪器，
+    /// 准备检测下一轮输出中的错误。
+    pub fn clear_error_state(&self) {
+        if let Ok(mut term) = self.terminal.lock() {
+            term.clear_new_content();
+        }
     }
 
     /// 停止运行标志并恢复终端模式
