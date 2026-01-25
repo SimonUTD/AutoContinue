@@ -770,65 +770,102 @@ impl VirtualTerminal {
         }
     }
 
-    /// 使用差异法检查是否有新增的红色内容
+    /// 使用改进的差异法检查是否有新增的红色内容
     ///
-    /// 比较当前屏幕缓冲区与基线快照的差异，只检测差异部分的红色。
-    /// 这样可以排除固定的 UI 元素（如状态栏、按钮等）。
+    /// 算法改进：
+    /// 1. 忽略底部状态栏区域（通常包含固定的红色UI元素）
+    /// 2. 基于行内容（而非位置）进行差异比较
+    /// 3. 只检测"新出现"的红色行内容
     ///
-    /// 返回 true 表示检测到新增的错误（红色差异内容）
+    /// 返回 true 表示检测到新增的错误（红色内容）
     pub fn has_red_content(&self) -> bool {
-        // 阈值配置
-        const MIN_RED_CHARS: usize = 5;      // 至少需要 5 个连续红色字符
-        const MIN_DIFF_CHARS: usize = 50;    // 差异内容至少需要 50 个字符（排除UI微小刷新）
+        // 配置
+        const IGNORE_BOTTOM_ROWS: usize = 3;  // 忽略底部3行（状态栏区域）
+        const MIN_RED_CHARS: usize = 5;       // 至少需要5个连续红色字符
 
-        let mut total_diff = 0;
-        let mut consecutive_red = 0;
+        // 收集基线中的行内容（用于排除已存在的内容）
+        let mut baseline_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let check_height = self.height.saturating_sub(IGNORE_BOTTOM_ROWS);
+
+        for row in 0..check_height {
+            let line: String = self.baseline_buffer[row]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim()
+                .to_string();
+            if !line.is_empty() {
+                baseline_lines.insert(line);
+            }
+        }
+
+        // 检查当前屏幕中的新内容
         let mut max_consecutive_red = 0;
 
-        // 逐行逐列比较，检测差异
-        for row in 0..self.height {
-            for col in 0..self.width {
-                let current = &self.buffer[row][col];
-                let baseline = &self.baseline_buffer[row][col];
+        for row in 0..check_height {
+            // 获取当前行内容
+            let line: String = self.buffer[row]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim()
+                .to_string();
 
-                // 检查是否有差异（字符或颜色不同）
-                let is_different = current.ch != baseline.ch || current.fg != baseline.fg;
+            // 如果这行内容在基线中已存在，跳过
+            if line.is_empty() || baseline_lines.contains(&line) {
+                continue;
+            }
 
-                if is_different && current.ch != ' ' {
-                    total_diff += 1;
-
-                    if current.fg.is_red() {
-                        consecutive_red += 1;
-                        max_consecutive_red = max_consecutive_red.max(consecutive_red);
-                    } else {
-                        consecutive_red = 0;
-                    }
+            // 这是新内容，检测红色
+            let mut consecutive_red = 0;
+            for cell in &self.buffer[row] {
+                if cell.fg.is_red() && cell.ch != ' ' {
+                    consecutive_red += 1;
+                    max_consecutive_red = max_consecutive_red.max(consecutive_red);
                 } else {
                     consecutive_red = 0;
                 }
             }
-            // 换行时重置连续计数
-            consecutive_red = 0;
         }
 
-        // 只有当差异内容足够多时，才认为是真正的新输出（而非UI刷新）
-        // 并且需要足够多的连续红色字符
-        total_diff >= MIN_DIFF_CHARS && max_consecutive_red >= MIN_RED_CHARS
+        max_consecutive_red >= MIN_RED_CHARS
     }
 
-    /// 获取新增的红色文本（差异法）
+    /// 获取新增的红色文本
     pub fn get_red_content(&self) -> String {
+        const IGNORE_BOTTOM_ROWS: usize = 3;
         let mut result = String::new();
 
-        for row in 0..self.height {
-            for col in 0..self.width {
-                let current = &self.buffer[row][col];
-                let baseline = &self.baseline_buffer[row][col];
+        let mut baseline_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let check_height = self.height.saturating_sub(IGNORE_BOTTOM_ROWS);
 
-                let is_different = current.ch != baseline.ch || current.fg != baseline.fg;
+        for row in 0..check_height {
+            let line: String = self.baseline_buffer[row]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim()
+                .to_string();
+            if !line.is_empty() {
+                baseline_lines.insert(line);
+            }
+        }
 
-                if is_different && current.fg.is_red() && current.ch != ' ' {
-                    result.push(current.ch);
+        for row in 0..check_height {
+            let line: String = self.buffer[row]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim()
+                .to_string();
+
+            if line.is_empty() || baseline_lines.contains(&line) {
+                continue;
+            }
+
+            for cell in &self.buffer[row] {
+                if cell.fg.is_red() && cell.ch != ' ' {
+                    result.push(cell.ch);
                 }
             }
         }
@@ -836,39 +873,57 @@ impl VirtualTerminal {
         result
     }
 
-    /// 获取红色字符统计信息（差异法，用于调试）
-    /// 返回 (总差异字符数, 总红色差异字符数, 最大连续红色差异字符数)
-    pub fn get_red_stats(&self) -> (usize, usize, usize) {
-        let mut total_diff = 0;
+    /// 获取统计信息（用于调试）
+    /// 返回 (检查行数, 新增行数, 红色字符数, 最大连续红色)
+    pub fn get_red_stats(&self) -> (usize, usize, usize, usize) {
+        const IGNORE_BOTTOM_ROWS: usize = 3;
+
+        let mut baseline_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let check_height = self.height.saturating_sub(IGNORE_BOTTOM_ROWS);
+
+        for row in 0..check_height {
+            let line: String = self.baseline_buffer[row]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim()
+                .to_string();
+            if !line.is_empty() {
+                baseline_lines.insert(line);
+            }
+        }
+
+        let mut new_lines = 0;
         let mut total_red = 0;
-        let mut consecutive_red = 0;
         let mut max_consecutive_red = 0;
 
-        for row in 0..self.height {
-            for col in 0..self.width {
-                let current = &self.buffer[row][col];
-                let baseline = &self.baseline_buffer[row][col];
+        for row in 0..check_height {
+            let line: String = self.buffer[row]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim()
+                .to_string();
 
-                let is_different = current.ch != baseline.ch || current.fg != baseline.fg;
+            if line.is_empty() || baseline_lines.contains(&line) {
+                continue;
+            }
 
-                if is_different && current.ch != ' ' {
-                    total_diff += 1;
+            new_lines += 1;
+            let mut consecutive_red = 0;
 
-                    if current.fg.is_red() {
-                        total_red += 1;
-                        consecutive_red += 1;
-                        max_consecutive_red = max_consecutive_red.max(consecutive_red);
-                    } else {
-                        consecutive_red = 0;
-                    }
+            for cell in &self.buffer[row] {
+                if cell.fg.is_red() && cell.ch != ' ' {
+                    total_red += 1;
+                    consecutive_red += 1;
+                    max_consecutive_red = max_consecutive_red.max(consecutive_red);
                 } else {
                     consecutive_red = 0;
                 }
             }
-            consecutive_red = 0;
         }
 
-        (total_diff, total_red, max_consecutive_red)
+        (check_height, new_lines, total_red, max_consecutive_red)
     }
 
     /// 获取新增内容中所有非默认颜色的调试信息（差异法）

@@ -162,11 +162,11 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
             auto_continue_count += 1;
 
             // 获取统计信息（用于诊断）
-            let (total_diff, total_red, max_consecutive) = runner.get_red_stats();
-            println!("\n[AC] 调试 - 差异={}, 红色={}, 连续={} (需要: 差异>=50 且 连续>=5)",
-                total_diff, total_red, max_consecutive);
+            let (check_rows, new_lines, total_red, max_consecutive) = runner.get_red_stats();
+            println!("\n[AC] 调试 - 检查{}行(忽略底部3行), 新增{}行, 红色{}字符, 连续{} (阈值>=5)",
+                check_rows, new_lines, total_red, max_consecutive);
 
-            // 检测是否有错误输出（需要足够多的差异内容和连续红色字符）
+            // 检测是否有错误输出
             let is_error = runner.has_error_output();
 
             // 根据错误状态选择提示词
