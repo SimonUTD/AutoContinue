@@ -101,6 +101,9 @@ pub struct VirtualTerminal {
     pub height: usize,
     /// 屏幕缓冲区
     pub buffer: Vec<Vec<Cell>>,
+    /// 基线屏幕快照（用于差异比较）
+    /// 保存上一次 clear_new_content() 时的屏幕状态
+    baseline_buffer: Vec<Vec<Cell>>,
     /// 光标行
     pub cursor_row: usize,
     /// 光标列
@@ -119,8 +122,7 @@ pub struct VirtualTerminal {
     pub scroll_top: usize,
     /// 滚动区域底部
     pub scroll_bottom: usize,
-    /// 新增内容追踪器
-    /// 记录自上次快照以来新增的带颜色的字符
+    /// 新增内容追踪器（已废弃，保留兼容性）
     new_content: Vec<(char, Color)>,
     /// 是否有新内容（非 UI 重绘）
     has_new_content: bool,
@@ -139,10 +141,12 @@ impl VirtualTerminal {
     /// 创建新的虚拟终端
     pub fn new(width: usize, height: usize) -> Self {
         let buffer = vec![vec![Cell::default(); width]; height];
+        let baseline_buffer = vec![vec![Cell::default(); width]; height];
         VirtualTerminal {
             width,
             height,
             buffer,
+            baseline_buffer,
             cursor_row: 0,
             cursor_col: 0,
             saved_cursor_row: 0,
@@ -766,70 +770,112 @@ impl VirtualTerminal {
         }
     }
 
-    /// 检查新增内容中是否包含足够多的红色文本
-    /// 只有连续红色字符超过阈值时才认为是错误，排除零散的 UI 元素
-    /// 返回 true 表示检测到错误
+    /// 使用差异法检查是否有新增的红色内容
+    ///
+    /// 比较当前屏幕缓冲区与基线快照的差异，只检测差异部分的红色。
+    /// 这样可以排除固定的 UI 元素（如状态栏、按钮等）。
+    ///
+    /// 返回 true 表示检测到新增的错误（红色差异内容）
     pub fn has_red_content(&self) -> bool {
-        // 阈值：至少需要 5 个连续的红色字符才认为是错误
+        // 阈值：至少需要 5 个连续的新增红色字符才认为是错误
         const MIN_RED_CHARS: usize = 5;
 
         let mut consecutive_red = 0;
         let mut max_consecutive_red = 0;
 
-        for (_, color) in &self.new_content {
-            if color.is_red() {
-                consecutive_red += 1;
-                max_consecutive_red = max_consecutive_red.max(consecutive_red);
-            } else {
-                consecutive_red = 0;
+        // 逐行逐列比较，检测差异
+        for row in 0..self.height {
+            for col in 0..self.width {
+                let current = &self.buffer[row][col];
+                let baseline = &self.baseline_buffer[row][col];
+
+                // 检查是否有差异（字符或颜色不同）
+                let is_different = current.ch != baseline.ch || current.fg != baseline.fg;
+
+                if is_different && current.fg.is_red() && current.ch != ' ' {
+                    consecutive_red += 1;
+                    max_consecutive_red = max_consecutive_red.max(consecutive_red);
+                } else {
+                    consecutive_red = 0;
+                }
             }
+            // 换行时重置连续计数（行末和行首不连续）
+            consecutive_red = 0;
         }
 
         max_consecutive_red >= MIN_RED_CHARS
     }
 
-    /// 获取新增内容中的红色文本
+    /// 获取新增的红色文本（差异法）
     pub fn get_red_content(&self) -> String {
-        self.new_content
-            .iter()
-            .filter(|(_, color)| color.is_red())
-            .map(|(ch, _)| *ch)
-            .collect()
+        let mut result = String::new();
+
+        for row in 0..self.height {
+            for col in 0..self.width {
+                let current = &self.buffer[row][col];
+                let baseline = &self.baseline_buffer[row][col];
+
+                let is_different = current.ch != baseline.ch || current.fg != baseline.fg;
+
+                if is_different && current.fg.is_red() && current.ch != ' ' {
+                    result.push(current.ch);
+                }
+            }
+        }
+
+        result
     }
 
-    /// 获取红色字符统计信息（用于调试）
+    /// 获取红色字符统计信息（差异法，用于调试）
+    /// 返回 (总红色差异字符数, 最大连续红色差异字符数)
     pub fn get_red_stats(&self) -> (usize, usize) {
-        let total_red: usize = self.new_content.iter().filter(|(_, c)| c.is_red()).count();
-
+        let mut total_red = 0;
         let mut consecutive_red = 0;
         let mut max_consecutive_red = 0;
-        for (_, color) in &self.new_content {
-            if color.is_red() {
-                consecutive_red += 1;
-                max_consecutive_red = max_consecutive_red.max(consecutive_red);
-            } else {
-                consecutive_red = 0;
+
+        for row in 0..self.height {
+            for col in 0..self.width {
+                let current = &self.buffer[row][col];
+                let baseline = &self.baseline_buffer[row][col];
+
+                let is_different = current.ch != baseline.ch || current.fg != baseline.fg;
+
+                if is_different && current.fg.is_red() && current.ch != ' ' {
+                    total_red += 1;
+                    consecutive_red += 1;
+                    max_consecutive_red = max_consecutive_red.max(consecutive_red);
+                } else {
+                    consecutive_red = 0;
+                }
             }
+            consecutive_red = 0;
         }
 
         (total_red, max_consecutive_red)
     }
 
-    /// 获取新增内容中所有非默认颜色的调试信息
+    /// 获取新增内容中所有非默认颜色的调试信息（差异法）
     /// 用于诊断颜色检测问题
     pub fn get_color_debug_info(&self) -> String {
         use std::collections::HashMap;
         let mut color_counts: HashMap<String, usize> = HashMap::new();
 
-        for (_, color) in &self.new_content {
-            if *color != Color::Default {
-                let key = format!("{:?}", color);
-                *color_counts.entry(key).or_insert(0) += 1;
+        for row in 0..self.height {
+            for col in 0..self.width {
+                let current = &self.buffer[row][col];
+                let baseline = &self.baseline_buffer[row][col];
+
+                let is_different = current.ch != baseline.ch || current.fg != baseline.fg;
+
+                if is_different && current.fg != Color::Default && current.ch != ' ' {
+                    let key = format!("{:?}", current.fg);
+                    *color_counts.entry(key).or_insert(0) += 1;
+                }
             }
         }
 
         if color_counts.is_empty() {
-            return String::from("无非默认颜色");
+            return String::from("无新增颜色内容");
         }
 
         color_counts
@@ -840,14 +886,20 @@ impl VirtualTerminal {
     }
 
     /// 清除新增内容追踪器（在发送提示词后调用）
-    /// 同时重置颜色和解析器状态，避免残留状态影响后续检测
+    /// 保存当前屏幕作为新的基线快照，用于下一次差异比较
     pub fn clear_new_content(&mut self) {
+        // 保存当前屏幕作为基线（用于差异比较）
+        self.baseline_buffer = self.buffer.clone();
+
+        // 清除旧的追踪器（兼容性保留）
         self.new_content.clear();
         self.has_new_content = false;
+
         // 重置颜色状态，避免CLI未重置颜色导致后续误判
         self.current_fg = Color::Default;
         self.current_bg = Color::Default;
         self.current_bold = false;
+
         // 重置解析器状态，避免中间状态影响后续解析
         self.reset_parser();
     }
