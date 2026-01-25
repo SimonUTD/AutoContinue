@@ -18,6 +18,7 @@ use crossterm::terminal;
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,6 +58,10 @@ pub struct Runner {
     /// 最后活动时间（输入或输出）
     /// 用于检测CLI是否处于静默状态（等待输入）
     last_activity_time: Arc<Mutex<Instant>>,
+
+    /// 用于注入输入到输入线程的 channel（发送端）
+    /// 通过这个 channel 发送的数据会被输入线程当作用户输入处理
+    inject_sender: Option<Sender<Vec<u8>>>,
 }
 
 impl Runner {
@@ -131,6 +136,7 @@ impl Runner {
             running,
             exit_status,
             last_activity_time,
+            inject_sender: None,
         })
     }
 
@@ -164,6 +170,11 @@ impl Runner {
 
         // 获取PTY写入器的共享引用
         let writer = self.writer.clone();
+        let writer_for_inject = self.writer.clone();
+
+        // 创建用于注入输入的 channel
+        let (inject_tx, inject_rx) = mpsc::channel::<Vec<u8>>();
+        self.inject_sender = Some(inject_tx);
 
         // 启动输出转发线程：PTY -> stdout
         // 每次有输出时更新最后活动时间
@@ -204,8 +215,24 @@ impl Runner {
         // 启动输入转发线程：stdin -> PTY
         // 使用crossterm的event系统正确处理特殊键（方向键、ESC等）
         // 每次有输入时更新最后活动时间
+        // 同时检查注入的输入（通过channel）
         let input_handle = thread::spawn(move || {
             while running_input.load(Ordering::SeqCst) {
+                // 首先检查是否有注入的输入
+                if let Ok(bytes) = inject_rx.try_recv() {
+                    // 更新最后活动时间
+                    if let Ok(mut time) = last_activity_input.lock() {
+                        *time = Instant::now();
+                    }
+                    // 发送注入的输入
+                    if let Ok(mut w) = writer_for_inject.lock() {
+                        if w.write_all(&bytes).is_err() {
+                            break;
+                        }
+                        let _ = w.flush();
+                    }
+                }
+
                 // 使用crossterm的event poll来非阻塞检测输入
                 match crossterm::event::poll(Duration::from_millis(50)) {
                     Ok(true) => {
@@ -277,7 +304,7 @@ impl Runner {
         Ok(())
     }
 
-    /// 向CLI发送一行输入（模拟打字，自动添加回车）
+    /// 向CLI发送一行输入（自动添加回车）
     ///
     /// # 参数
     /// - `line`: 要发送的输入行
@@ -285,15 +312,17 @@ impl Runner {
     /// # 返回值
     /// 成功返回Ok(())，失败返回错误
     pub fn send_line(&mut self, line: &str) -> Result<()> {
-        // 逐字符发送，模拟真实打字，避免被当作粘贴
-        for c in line.chars() {
-            self.send_input(&c.to_string())?;
-            // 字符之间加小延迟
-            thread::sleep(Duration::from_millis(5));
+        // 发送文本内容（直接写入PTY）
+        self.send_input(line)?;
+
+        // 发送回车通过 channel，让输入线程发送
+        // 这样回车和用户按Enter走同样的路径
+        if let Some(ref sender) = self.inject_sender {
+            // 发送 \r（与 key_event_to_bytes 中 Enter 键一致）
+            let _ = sender.send(vec![b'\r']);
         }
-        // 发送回车（与用户按 Enter 时 key_event_to_bytes 发送的一致）
-        thread::sleep(Duration::from_millis(10));
-        self.send_input("\r")
+
+        Ok(())
     }
 
     /// 获取自上次活动以来的静默时间
