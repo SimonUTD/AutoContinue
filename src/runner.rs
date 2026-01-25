@@ -13,7 +13,7 @@
 //! - Unix/Linux/macOS: 使用传统PTY
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use std::io::{Read, Write};
@@ -400,8 +400,18 @@ fn event_to_bytes(event: &Event) -> Option<Vec<u8>> {
 ///
 /// # 返回值
 /// 返回对应的字节序列
+///
+/// # 注意
+/// 只处理 KeyEventKind::Press 事件，忽略 Release 事件
+/// 这是因为Windows上crossterm会同时报告按下和释放事件
 fn key_event_to_bytes(key_event: &KeyEvent) -> Option<Vec<u8>> {
-    let KeyEvent { code, modifiers, .. } = key_event;
+    let KeyEvent { code, modifiers, kind, .. } = key_event;
+
+    // 只处理按键按下事件，忽略释放事件（避免重复输入）
+    // Windows上crossterm会报告Press和Release两个事件
+    if *kind != KeyEventKind::Press && *kind != KeyEventKind::Repeat {
+        return None;
+    }
 
     // 处理Ctrl组合键
     if modifiers.contains(KeyModifiers::CONTROL) {
