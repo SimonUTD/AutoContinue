@@ -50,24 +50,28 @@ pub enum Color {
 }
 
 impl Color {
-    /// 检查是否为红色系
-    /// 包括：标准红色(1,9)、256色中的红色、RGB红色
+    /// 检查是否为纯红色（错误颜色）
+    ///
+    /// 注意：只检测明显的"错误红色"，排除橙色、粉色等渐变色
+    /// 大多数 CLI 工具使用标准 ANSI 红色（31m 或 91m）表示错误
     pub fn is_red(&self) -> bool {
         match self {
-            // 标准红色：1=红色, 9=亮红色
+            // 标准红色：1=红色(31m), 9=亮红色(91m)
+            // 这是最可靠的错误检测方式，大多数 CLI 使用这种方式
             Color::Ansi(1) | Color::Ansi(9) => true,
             // 其他 ANSI 颜色不是红色
             Color::Ansi(_) => false,
-            // 256 色调色板中的红色范围
-            // 基本红色：1, 9
-            // 扩展红色：52-57, 88-93, 124-129, 160-165, 196-201
+            // 256 色调色板中的纯红色
+            // 只选择明显的红色，排除橙色和粉色
+            // 1=红色, 9=亮红, 196=纯红(#ff0000)
             Color::Palette(n) => {
-                matches!(n, 1 | 9 | 52..=57 | 88..=93 | 124..=129 | 160..=165 | 196..=201)
+                matches!(n, 1 | 9 | 196)
             }
-            // RGB 红色：R 分量显著大于 G 和 B
-            // 放宽条件：R > 128 且是主导色（R > G + 30 且 R > B + 30）
+            // RGB 红色：只检测非常纯的红色
+            // 要求：R 很高(>200)，G 和 B 都很低(<80)
+            // 这样可以排除橙色(255,153,51)、粉色(255,102,102)等
             Color::Rgb(r, g, b) => {
-                *r > 128 && *r > *g + 30 && *r > *b + 30
+                *r > 200 && *g < 80 && *b < 80
             }
             Color::Default => false,
         }
@@ -831,11 +835,17 @@ mod tests {
 
     #[test]
     fn test_color_is_red() {
+        // ANSI 标准红色
         assert!(Color::Ansi(1).is_red());
         assert!(Color::Ansi(9).is_red());
         assert!(!Color::Ansi(2).is_red());
-        assert!(Color::Rgb(200, 50, 50).is_red());
-        assert!(!Color::Rgb(50, 200, 50).is_red());
+        // 纯红色 RGB
+        assert!(Color::Rgb(255, 0, 0).is_red());
+        assert!(Color::Rgb(220, 30, 30).is_red());
+        // 橙色、粉色不是红色
+        assert!(!Color::Rgb(255, 153, 51).is_red());  // 橙色
+        assert!(!Color::Rgb(255, 102, 102).is_red()); // 粉色
+        assert!(!Color::Rgb(50, 200, 50).is_red());   // 绿色
     }
 
     #[test]
