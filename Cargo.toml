@@ -33,3 +33,7 @@ thiserror = "1"
 # 优化发布版本
 opt-level = 3
 lto = true
+
+[dev-dependencies]
+# 测试用临时文件库
+tempfile = "3"
