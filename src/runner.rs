@@ -287,8 +287,10 @@ impl Runner {
     pub fn send_line(&mut self, line: &str) -> Result<()> {
         // 发送文本内容
         self.send_input(line)?;
-        // 发送换行符触发提交（尝试 \n）
-        self.send_input("\n")
+        // 等待一小段时间，让 CLI 处理文本
+        thread::sleep(Duration::from_millis(100));
+        // 发送回车+换行
+        self.send_input("\r\n")
     }
 
     /// 获取自上次活动以来的静默时间
@@ -453,7 +455,7 @@ fn key_event_to_bytes(key_event: &KeyEvent) -> Option<Vec<u8>> {
         // 普通字符
         KeyCode::Char(c) => Some(c.to_string().into_bytes()),
 
-        // 回车键 - 发送 \r（重要：不是 \n）
+        // 回车键 - 发送 \r
         KeyCode::Enter => Some(vec![b'\r']),
 
         // 退格键
