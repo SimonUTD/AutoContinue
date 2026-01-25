@@ -1,0 +1,205 @@
+# Release 工作流 - 自动构建和发布
+# 当推送 v* 标签时触发，构建多平台二进制文件并创建 GitHub Release
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: ac
+
+jobs:
+  # 创建 Release
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: AutoContinue ${{ steps.get_version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 构建各平台二进制文件
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            ext: .exe
+
+          # Windows x86 (32-bit)
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            ext: .exe
+
+          # Linux x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            ext: ""
+
+          # Linux x86 (32-bit)
+          - target: i686-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            ext: ""
+
+          # macOS x64 (Intel)
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            ext: ""
+
+          # macOS ARM64 (Apple Silicon)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            ext: ""
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Linux 32-bit 需要安装额外的库
+      - name: Install Linux 32-bit dependencies
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib libc6-dev-i386
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # 打包 Windows 版本 (zip)
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $version = "${{ needs.create-release.outputs.version }}"
+          $target = "${{ matrix.target }}"
+          $archiveName = "ac-$version-$target.zip"
+
+          # 创建临时目录
+          New-Item -ItemType Directory -Force -Path "release"
+
+          # 复制文件
+          Copy-Item "target/$target/release/ac.exe" "release/"
+          Copy-Item "README.md" "release/"
+          Copy-Item "LICENSE" "release/"
+
+          # 创建 zip
+          Compress-Archive -Path "release/*" -DestinationPath $archiveName
+
+          # 输出文件名供后续步骤使用
+          echo "ARCHIVE_NAME=$archiveName" >> $env:GITHUB_ENV
+
+      # 打包 Unix 版本 (tar.gz)
+      - name: Package (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          version="${{ needs.create-release.outputs.version }}"
+          target="${{ matrix.target }}"
+          archive_name="ac-${version}-${target}.tar.gz"
+
+          # 创建临时目录
+          mkdir -p release
+
+          # 复制文件
+          cp "target/${target}/release/ac" "release/"
+          cp README.md release/
+          cp LICENSE release/
+
+          # 创建 tar.gz
+          tar -czvf "${archive_name}" -C release .
+
+          # 输出文件名供后续步骤使用
+          echo "ARCHIVE_NAME=${archive_name}" >> $GITHUB_ENV
+
+      # 上传到 Release
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.create-release.outputs.version }}
+          files: ${{ env.ARCHIVE_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 构建完成后更新 Release 说明
+  update-release:
+    name: Update Release Notes
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Update Release Body
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.create-release.outputs.version }}
+          body: |
+            ## AutoContinue ${{ needs.create-release.outputs.version }}
+
+            智能 CLI 工具包装器，用于自动继续/重试 AI CLI 工具。
+
+            ### 下载
+
+            | 平台 | 架构 | 下载 |
+            |------|------|------|
+            | Windows | x64 | `ac-${{ needs.create-release.outputs.version }}-x86_64-pc-windows-msvc.zip` |
+            | Windows | x86 | `ac-${{ needs.create-release.outputs.version }}-i686-pc-windows-msvc.zip` |
+            | Linux | x64 | `ac-${{ needs.create-release.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux | x86 | `ac-${{ needs.create-release.outputs.version }}-i686-unknown-linux-gnu.tar.gz` |
+            | macOS | x64 (Intel) | `ac-${{ needs.create-release.outputs.version }}-x86_64-apple-darwin.tar.gz` |
+            | macOS | ARM64 (Apple Silicon) | `ac-${{ needs.create-release.outputs.version }}-aarch64-apple-darwin.tar.gz` |
+
+            ### 安装方法
+
+            1. 下载对应平台的压缩包
+            2. 解压到任意目录
+            3. 将 `ac` (或 `ac.exe`) 添加到系统 PATH
+
+            ### 快速开始
+
+            ```bash
+            ac claude --resume -cp "继续" -rp "重试"
+            ```
+
+            详细使用说明请参阅 [README.md](https://github.com/MoYeRanQianZhi/AutoContinue#readme)
+          append_body: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
