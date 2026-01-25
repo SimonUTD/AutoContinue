@@ -2,7 +2,7 @@
 # AutoContinue (AC) - 自动继续/重试CLI工具的包装器
 name = "autocontinue"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["MoYeRanQianZhi <MoYeRanQianZhi@gmail.com>"]
 description = "A CLI wrapper that automatically continues or retries CLI tools like Claude, Codex, Gemini, etc."
 license = "MIT"
