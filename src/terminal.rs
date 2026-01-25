@@ -766,10 +766,26 @@ impl VirtualTerminal {
         }
     }
 
-    /// 检查新增内容中是否包含红色文本
+    /// 检查新增内容中是否包含足够多的红色文本
+    /// 只有连续红色字符超过阈值时才认为是错误，排除零散的 UI 元素
     /// 返回 true 表示检测到错误
     pub fn has_red_content(&self) -> bool {
-        self.new_content.iter().any(|(_, color)| color.is_red())
+        // 阈值：至少需要 5 个连续的红色字符才认为是错误
+        const MIN_RED_CHARS: usize = 5;
+
+        let mut consecutive_red = 0;
+        let mut max_consecutive_red = 0;
+
+        for (_, color) in &self.new_content {
+            if color.is_red() {
+                consecutive_red += 1;
+                max_consecutive_red = max_consecutive_red.max(consecutive_red);
+            } else {
+                consecutive_red = 0;
+            }
+        }
+
+        max_consecutive_red >= MIN_RED_CHARS
     }
 
     /// 获取新增内容中的红色文本
@@ -779,6 +795,24 @@ impl VirtualTerminal {
             .filter(|(_, color)| color.is_red())
             .map(|(ch, _)| *ch)
             .collect()
+    }
+
+    /// 获取红色字符统计信息（用于调试）
+    pub fn get_red_stats(&self) -> (usize, usize) {
+        let total_red: usize = self.new_content.iter().filter(|(_, c)| c.is_red()).count();
+
+        let mut consecutive_red = 0;
+        let mut max_consecutive_red = 0;
+        for (_, color) in &self.new_content {
+            if color.is_red() {
+                consecutive_red += 1;
+                max_consecutive_red = max_consecutive_red.max(consecutive_red);
+            } else {
+                consecutive_red = 0;
+            }
+        }
+
+        (total_red, max_consecutive_red)
     }
 
     /// 获取新增内容中所有非默认颜色的调试信息

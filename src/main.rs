@@ -161,11 +161,11 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
         if silence_duration >= silence_threshold {
             auto_continue_count += 1;
 
-            // 获取颜色调试信息（用于诊断）
-            let color_debug = runner.get_color_debug_info();
-            println!("\n[AC] 调试 - 检测到的颜色: {}", color_debug);
+            // 获取红色字符统计（用于诊断）
+            let (total_red, max_consecutive) = runner.get_red_stats();
+            println!("\n[AC] 调试 - 红色字符: 总数={}, 最大连续={} (阈值=5)", total_red, max_consecutive);
 
-            // 检测是否有错误输出（红色文本）
+            // 检测是否有错误输出（需要至少5个连续红色字符）
             let is_error = runner.has_error_output();
 
             // 根据错误状态选择提示词

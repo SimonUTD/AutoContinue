@@ -469,6 +469,17 @@ impl Runner {
         }
     }
 
+    /// 获取红色字符统计信息
+    ///
+    /// 返回 (总红色字符数, 最大连续红色字符数)
+    pub fn get_red_stats(&self) -> (usize, usize) {
+        if let Ok(term) = self.terminal.lock() {
+            term.get_red_stats()
+        } else {
+            (0, 0)
+        }
+    }
+
     /// 清除错误检测状态
     ///
     /// 在发送提示词后调用，重置新增内容追踪器，
