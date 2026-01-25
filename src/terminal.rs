@@ -770,53 +770,34 @@ impl VirtualTerminal {
         }
     }
 
-    /// 使用改进的差异法检查是否有新增的红色内容
+    /// 使用 LCS 对齐算法检查是否有新增的红色内容
     ///
-    /// 算法改进：
-    /// 1. 忽略底部状态栏区域（通常包含固定的红色UI元素）
-    /// 2. 基于行内容（而非位置）进行差异比较
-    /// 3. 只检测"新出现"的红色行内容
+    /// 算法步骤：
+    /// 1. 提取基线和当前屏幕的行内容（忽略底部状态栏）
+    /// 2. 使用 LCS 算法对齐两个列表，找出真正新增的行
+    /// 3. 只在新增行中检测红色
     ///
-    /// 返回 true 表示检测到新增的错误（红色内容）
+    /// 返回 true 表示检测到新增的错误
     pub fn has_red_content(&self) -> bool {
-        // 配置
-        const IGNORE_BOTTOM_ROWS: usize = 3;  // 忽略底部3行（状态栏区域）
-        const MIN_RED_CHARS: usize = 5;       // 至少需要5个连续红色字符
+        const IGNORE_BOTTOM_ROWS: usize = 3;
+        const MIN_RED_CHARS: usize = 5;
 
-        // 收集基线中的行内容（用于排除已存在的内容）
-        let mut baseline_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
         let check_height = self.height.saturating_sub(IGNORE_BOTTOM_ROWS);
 
-        for row in 0..check_height {
-            let line: String = self.baseline_buffer[row]
-                .iter()
-                .map(|c| c.ch)
-                .collect::<String>()
-                .trim()
-                .to_string();
-            if !line.is_empty() {
-                baseline_lines.insert(line);
-            }
-        }
+        // 提取基线和当前屏幕的行内容
+        let baseline_lines = self.extract_lines(&self.baseline_buffer, check_height);
+        let current_lines = self.extract_lines(&self.buffer, check_height);
 
-        // 检查当前屏幕中的新内容
+        // 使用 LCS 找出新增的行索引
+        let new_line_indices = self.find_new_lines(&baseline_lines, &current_lines);
+
+        // 在新增行中检测红色
         let mut max_consecutive_red = 0;
 
-        for row in 0..check_height {
-            // 获取当前行内容
-            let line: String = self.buffer[row]
-                .iter()
-                .map(|c| c.ch)
-                .collect::<String>()
-                .trim()
-                .to_string();
-
-            // 如果这行内容在基线中已存在，跳过
-            if line.is_empty() || baseline_lines.contains(&line) {
+        for &row in &new_line_indices {
+            if row >= check_height {
                 continue;
             }
-
-            // 这是新内容，检测红色
             let mut consecutive_red = 0;
             for cell in &self.buffer[row] {
                 if cell.fg.is_red() && cell.ch != ' ' {
@@ -831,45 +812,84 @@ impl VirtualTerminal {
         max_consecutive_red >= MIN_RED_CHARS
     }
 
-    /// 获取新增的红色文本
-    pub fn get_red_content(&self) -> String {
-        const IGNORE_BOTTOM_ROWS: usize = 3;
-        let mut result = String::new();
-
-        let mut baseline_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let check_height = self.height.saturating_sub(IGNORE_BOTTOM_ROWS);
-
-        for row in 0..check_height {
-            let line: String = self.baseline_buffer[row]
+    /// 提取屏幕行内容（去除尾部空格）
+    fn extract_lines(&self, buffer: &[Vec<Cell>], height: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for row in 0..height.min(buffer.len()) {
+            let line: String = buffer[row]
                 .iter()
                 .map(|c| c.ch)
                 .collect::<String>()
-                .trim()
+                .trim_end()
                 .to_string();
-            if !line.is_empty() {
-                baseline_lines.insert(line);
+            lines.push(line);
+        }
+        lines
+    }
+
+    /// 使用 LCS 算法找出新增的行索引
+    /// 返回当前屏幕中新增行的索引列表
+    fn find_new_lines(&self, baseline: &[String], current: &[String]) -> Vec<usize> {
+        let m = baseline.len();
+        let n = current.len();
+
+        if m == 0 {
+            // 基线为空，所有当前行都是新的
+            return (0..n).collect();
+        }
+
+        // 计算 LCS 长度表
+        let mut dp = vec![vec![0usize; n + 1]; m + 1];
+        for i in 1..=m {
+            for j in 1..=n {
+                if baseline[i - 1] == current[j - 1] {
+                    dp[i][j] = dp[i - 1][j - 1] + 1;
+                } else {
+                    dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+                }
             }
         }
 
-        for row in 0..check_height {
-            let line: String = self.buffer[row]
-                .iter()
-                .map(|c| c.ch)
-                .collect::<String>()
-                .trim()
-                .to_string();
+        // 回溯找出 LCS 中的行（当前屏幕的索引）
+        let mut lcs_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut i = m;
+        let mut j = n;
+        while i > 0 && j > 0 {
+            if baseline[i - 1] == current[j - 1] {
+                lcs_indices.insert(j - 1);
+                i -= 1;
+                j -= 1;
+            } else if dp[i - 1][j] > dp[i][j - 1] {
+                i -= 1;
+            } else {
+                j -= 1;
+            }
+        }
 
-            if line.is_empty() || baseline_lines.contains(&line) {
+        // 不在 LCS 中的行就是新增的
+        (0..n).filter(|idx| !lcs_indices.contains(idx)).collect()
+    }
+
+    /// 获取新增的红色文本
+    pub fn get_red_content(&self) -> String {
+        const IGNORE_BOTTOM_ROWS: usize = 3;
+        let check_height = self.height.saturating_sub(IGNORE_BOTTOM_ROWS);
+
+        let baseline_lines = self.extract_lines(&self.baseline_buffer, check_height);
+        let current_lines = self.extract_lines(&self.buffer, check_height);
+        let new_line_indices = self.find_new_lines(&baseline_lines, &current_lines);
+
+        let mut result = String::new();
+        for &row in &new_line_indices {
+            if row >= check_height {
                 continue;
             }
-
             for cell in &self.buffer[row] {
                 if cell.fg.is_red() && cell.ch != ' ' {
                     result.push(cell.ch);
                 }
             }
         }
-
         result
     }
 
@@ -877,41 +897,20 @@ impl VirtualTerminal {
     /// 返回 (检查行数, 新增行数, 红色字符数, 最大连续红色)
     pub fn get_red_stats(&self) -> (usize, usize, usize, usize) {
         const IGNORE_BOTTOM_ROWS: usize = 3;
-
-        let mut baseline_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
         let check_height = self.height.saturating_sub(IGNORE_BOTTOM_ROWS);
 
-        for row in 0..check_height {
-            let line: String = self.baseline_buffer[row]
-                .iter()
-                .map(|c| c.ch)
-                .collect::<String>()
-                .trim()
-                .to_string();
-            if !line.is_empty() {
-                baseline_lines.insert(line);
-            }
-        }
+        let baseline_lines = self.extract_lines(&self.baseline_buffer, check_height);
+        let current_lines = self.extract_lines(&self.buffer, check_height);
+        let new_line_indices = self.find_new_lines(&baseline_lines, &current_lines);
 
-        let mut new_lines = 0;
         let mut total_red = 0;
         let mut max_consecutive_red = 0;
 
-        for row in 0..check_height {
-            let line: String = self.buffer[row]
-                .iter()
-                .map(|c| c.ch)
-                .collect::<String>()
-                .trim()
-                .to_string();
-
-            if line.is_empty() || baseline_lines.contains(&line) {
+        for &row in &new_line_indices {
+            if row >= check_height {
                 continue;
             }
-
-            new_lines += 1;
             let mut consecutive_red = 0;
-
             for cell in &self.buffer[row] {
                 if cell.fg.is_red() && cell.ch != ' ' {
                     total_red += 1;
@@ -923,7 +922,7 @@ impl VirtualTerminal {
             }
         }
 
-        (check_height, new_lines, total_red, max_consecutive_red)
+        (check_height, new_line_indices.len(), total_red, max_consecutive_red)
     }
 
     /// 获取新增内容中所有非默认颜色的调试信息（差异法）
