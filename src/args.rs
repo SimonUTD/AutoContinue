@@ -8,6 +8,7 @@
 //! - `-rp, --retry-prompt`: 重试的提示词
 //! - `-rpf, --retry-prompt-file`: 重试的提示词文件
 //! - `-st, --sleep-time`: 等待时间（秒），默认15秒
+//! - `-sth, --silence-threshold`: 静默阈值（秒），默认30秒
 //! - `-h, --help`: 显示帮助信息
 //! - `-v, --version`: 显示版本信息
 //!
@@ -55,6 +56,11 @@ pub struct Args {
     /// 超过该时间则自动继续，默认15秒
     #[arg(short = 's', long = "sleep-time", visible_alias = "st", value_name = "SECONDS", default_value = "15")]
     pub sleep_time: u64,
+
+    /// 静默阈值（秒），CLI无输入/输出超过此时间后开始计算等待时间
+    /// 默认30秒，总等待时间 = 静默阈值 + 等待时间
+    #[arg(short = 't', long = "silence-threshold", visible_alias = "sth", value_name = "SECONDS", default_value = "30")]
+    pub silence_threshold: u64,
 
     /// 传递给CLI程序的其他参数
     /// 这些参数会原样传递给CLI程序
@@ -105,6 +111,7 @@ mod tests {
         let args = parse_args_from(["ac", "claude"]);
         assert_eq!(args.cli, "claude");
         assert_eq!(args.sleep_time, 15);
+        assert_eq!(args.silence_threshold, 30);
     }
 
     /// 测试带有继续提示词的参数

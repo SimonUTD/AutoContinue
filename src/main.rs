@@ -3,10 +3,10 @@
 //! AutoContinue是一个CLI工具包装器，用于自动继续或重试CLI工具的运行。
 //!
 //! ## 功能特性
-//! - 自动检测CLI进程状态
-//! - CLI正常结束时自动发送继续提示词
-//! - CLI出错时自动发送重试提示词
+//! - 自动检测CLI静默状态（无输入/输出）
+//! - 静默超过阈值时自动发送继续提示词
 //! - 保持CLI的完整交互性，用户可正常操作
+//! - 任何输入/输出都会重置静默计时器
 //! - Ctrl+C优雅退出
 //!
 //! ## 使用示例
@@ -26,7 +26,7 @@ use std::thread;
 use std::time::Duration;
 
 use config::Config;
-use monitor::{create_exit_flag, setup_ctrlc_handler, Monitor};
+use monitor::{create_exit_flag, setup_ctrlc_handler};
 use runner::Runner;
 
 /// 程序版本号
@@ -61,15 +61,19 @@ fn main() -> Result<()> {
 /// # 参数
 /// - `config`: 程序配置
 fn print_banner(config: &Config) {
+    // 计算总等待时间
+    let total_wait = config.silence_threshold + config.sleep_time;
+
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║           AutoContinue (AC) v{}                        ║", VERSION);
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  CLI: {:50} ║", config.cli);
-    println!("║  等待时间: {:3} 秒                                        ║", config.sleep_time);
+    println!("║  静默阈值: {:3} 秒 (用户设置)                             ║", config.silence_threshold);
+    println!("║  额外等待: {:3} 秒 (用户设置)                             ║", config.sleep_time);
+    println!("║  总等待:   {:3} 秒                                        ║", total_wait);
     println!("║  继续提示词: {:44} ║", truncate_str(&config.continue_prompt, 44));
-    println!("║  重试提示词: {:44} ║", truncate_str(&config.retry_prompt, 44));
     println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║  按 Ctrl+C 退出                                          ║");
+    println!("║  按 Ctrl+C 退出 | 任何输入/输出都会重置计时器            ║");
     println!("╚══════════════════════════════════════════════════════════╝");
     println!();
 }
@@ -95,10 +99,10 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 ///
 /// 该函数实现核心的无限循环逻辑：
 /// 1. 启动CLI进程
-/// 2. 监控进程状态
-/// 3. 进程退出时等待用户响应
-/// 4. 超时后自动发送继续/重试提示词
-/// 5. 重复上述过程
+/// 2. 持续监控静默时间
+/// 3. 静默超过阈值时自动发送继续提示词
+/// 4. 任何输入/输出都会重置计时器
+/// 5. 循环直到用户按Ctrl+C或CLI进程退出
 ///
 /// # 参数
 /// - `config`: 程序配置
@@ -106,183 +110,68 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 ///
 /// # 返回值
 /// 成功返回Ok(())，失败返回错误
-#[allow(unused_assignments)]
 fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
-    // 创建状态监控器
-    let mut monitor = Monitor::new(config.sleep_time, exit_flag.clone());
+    // 计算总静默阈值：静默阈值 + 用户设置的等待时间
+    let silence_threshold = Duration::from_secs(config.silence_threshold + config.sleep_time);
 
-    // 循环计数器
-    let mut iteration = 0u64;
+    // 自动继续计数器
+    let mut auto_continue_count = 0u64;
 
-    // 待发送的提示词（用于下一次迭代）
-    let mut pending_prompt: Option<String> = None;
-
-    // 主循环：持续运行直到用户按Ctrl+C
-    while !monitor.should_exit() {
-        iteration += 1;
-        println!("\n[AC] === 第 {} 次迭代 ===", iteration);
-
-        // 启动CLI进程
-        let runner_result = start_cli(&config);
-
-        match runner_result {
-            Ok(mut runner) => {
-                // 设置运行标志
-                monitor.set_running_flag(runner.get_running_flag());
-                monitor.set_running();
-
-                // 启动双向IO转发（stdout和stdin）
-                let io_handles = runner.start_io_forwarding()?;
-
-                // 如果有待发送的提示词，发送它
-                if let Some(ref prompt) = pending_prompt {
-                    // 等待一小段时间让CLI准备好接收输入
-                    thread::sleep(Duration::from_millis(500));
-                    println!("[AC] 发送提示词: {}", prompt);
-                    if let Err(e) = runner.send_line(prompt) {
-                        eprintln!("[AC] 发送提示词失败: {}", e);
-                    }
-                    pending_prompt = None;
-                }
-
-                // 监控进程状态
-                let exit_status = monitor_process(&mut runner, &mut monitor, &exit_flag)?;
-
-                // 停止IO转发并恢复终端模式
-                runner.stop();
-                // 不等待IO线程，让它自然结束
-                drop(io_handles);
-
-                // 如果需要退出，跳出循环
-                if monitor.should_exit() {
-                    break;
-                }
-
-                // 根据退出状态决定发送哪个提示词
-                let prompt = if runner::is_success(&exit_status) {
-                    println!("\n[AC] CLI正常结束，准备发送继续提示词...");
-                    &config.continue_prompt
-                } else {
-                    println!("\n[AC] CLI出错退出，准备发送重试提示词...");
-                    &config.retry_prompt
-                };
-
-                // 等待用户响应或超时
-                if wait_for_user_or_timeout(&mut monitor, &exit_flag)? {
-                    // 用户手动响应了，不需要自动发送
-                    println!("[AC] 检测到用户输入，跳过自动发送");
-                    pending_prompt = None;
-                    continue;
-                }
-
-                // 如果需要退出，跳出循环
-                if monitor.should_exit() {
-                    break;
-                }
-
-                println!("[AC] 等待超时，下一次迭代将自动发送: {}", prompt);
-                pending_prompt = Some(prompt.clone());
-            }
-            Err(e) => {
-                eprintln!("\n[AC] 启动CLI失败: {}", e);
-                eprintln!("[AC] {} 秒后重试...", config.sleep_time);
-
-                // 等待后重试
-                if wait_with_interrupt(config.sleep_time, &exit_flag) {
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// 启动CLI进程
-///
-/// # 参数
-/// - `config`: 程序配置
-///
-/// # 返回值
-/// 成功返回Runner实例，失败返回错误
-fn start_cli(config: &Config) -> Result<Runner> {
     println!("[AC] 正在启动: {} {}", config.cli, config.cli_args.join(" "));
 
-    Runner::new(&config.cli, &config.cli_args)
-}
+    // 启动CLI进程
+    let mut runner = Runner::new(&config.cli, &config.cli_args)?;
 
-/// 监控CLI进程状态
-///
-/// # 参数
-/// - `runner`: CLI运行器
-/// - `monitor`: 状态监控器
-/// - `exit_flag`: 退出标志
-///
-/// # 返回值
-/// 返回CLI进程的退出状态
-fn monitor_process(
-    runner: &mut Runner,
-    _monitor: &mut Monitor,
-    exit_flag: &Arc<AtomicBool>,
-) -> Result<portable_pty::ExitStatus> {
-    // 循环检查进程状态
+    // 启动双向IO转发（stdout和stdin）
+    let _io_handles = runner.start_io_forwarding()?;
+
+    println!("[AC] CLI已启动，开始监控静默状态...");
+    println!("[AC] 静默超过 {} 秒将自动发送继续提示词", silence_threshold.as_secs());
+
+    // 主监控循环
     loop {
-        // 检查是否需要退出
+        // 检查是否需要退出（Ctrl+C）
         if exit_flag.load(Ordering::SeqCst) {
-            // 等待进程结束
-            return runner.wait();
+            println!("\n[AC] 收到退出信号...");
+            break;
         }
 
-        // 检查进程是否仍在运行
+        // 检查CLI进程是否仍在运行
         if !runner.is_running() {
-            // 进程已结束，获取退出状态
-            if let Some(status) = runner.get_exit_status() {
-                return Ok(status);
+            println!("\n[AC] CLI进程已退出");
+            break;
+        }
+
+        // 获取当前静默时间
+        let silence_duration = runner.get_silence_duration();
+
+        // 检查是否超过静默阈值
+        if silence_duration >= silence_threshold {
+            auto_continue_count += 1;
+
+            // 发送继续提示词
+            println!("\n[AC] === 静默 {} 秒，自动发送第 {} 次继续提示词 ===",
+                silence_duration.as_secs(), auto_continue_count);
+            println!("[AC] 发送: {}", config.continue_prompt);
+
+            if let Err(e) = runner.send_line(&config.continue_prompt) {
+                eprintln!("[AC] 发送提示词失败: {}", e);
             }
-            // 等待获取退出状态
-            return runner.wait();
+
+            // 发送后活动时间会自动更新（在send_input中）
+            // 不需要手动重置
         }
 
-        // 短暂休眠避免忙等待
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// 等待用户响应或超时
-///
-/// # 参数
-/// - `monitor`: 状态监控器
-/// - `exit_flag`: 退出标志
-///
-/// # 返回值
-/// 如果用户有输入返回true，超时返回false
-fn wait_for_user_or_timeout(
-    monitor: &mut Monitor,
-    exit_flag: &Arc<AtomicBool>,
-) -> Result<bool> {
-    monitor.set_waiting_user();
-
-    let wait_time = monitor.remaining_wait_time();
-    println!(
-        "[AC] 等待 {} 秒让用户响应（或自动继续）...",
-        wait_time.as_secs()
-    );
-
-    // 简化版本：直接使用计时器等待
-    // 注意：当前版本不检测键盘输入，仅依赖等待超时
-    let start = std::time::Instant::now();
-
-    while start.elapsed() < wait_time {
-        // 检查退出标志
-        if exit_flag.load(Ordering::SeqCst) {
-            return Ok(false);
-        }
-
-        // 短暂休眠避免忙等待
-        thread::sleep(Duration::from_millis(100));
+        // 短暂休眠避免忙等待（每500ms检查一次）
+        thread::sleep(Duration::from_millis(500));
     }
 
-    Ok(false)
+    // 停止IO转发并恢复终端模式
+    runner.stop();
+
+    println!("[AC] 共自动发送了 {} 次继续提示词", auto_continue_count);
+
+    Ok(())
 }
 
 /// 带中断的等待
@@ -293,6 +182,7 @@ fn wait_for_user_or_timeout(
 ///
 /// # 返回值
 /// 如果被中断返回true，正常超时返回false
+#[allow(dead_code)]
 fn wait_with_interrupt(seconds: u64, exit_flag: &Arc<AtomicBool>) -> bool {
     let duration = Duration::from_secs(seconds);
     let start = std::time::Instant::now();

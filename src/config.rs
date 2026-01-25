@@ -23,6 +23,9 @@ const DEFAULT_RETRY_PROMPT: &str = "重试";
 /// 默认的等待时间（秒）
 pub const DEFAULT_SLEEP_TIME: u64 = 15;
 
+/// 默认的静默阈值（秒）
+pub const DEFAULT_SILENCE_THRESHOLD: u64 = 30;
+
 /// AutoContinue配置结构体
 ///
 /// 该结构体包含所有运行时需要的配置信息。
@@ -47,6 +50,11 @@ pub struct Config {
     /// 在自动发送提示词之前等待的时间
     /// 给用户自主回复的机会
     pub sleep_time: u64,
+
+    /// 静默阈值（秒）
+    /// CLI无输入/输出超过此时间后开始计算等待时间
+    /// 总等待时间 = 静默阈值 + 等待时间
+    pub silence_threshold: u64,
 }
 
 impl Config {
@@ -106,6 +114,7 @@ impl Config {
             continue_prompt,
             retry_prompt,
             sleep_time: args.sleep_time,
+            silence_threshold: args.silence_threshold,
         })
     }
 
@@ -151,6 +160,7 @@ impl Default for Config {
             continue_prompt: DEFAULT_CONTINUE_PROMPT.to_string(),
             retry_prompt: DEFAULT_RETRY_PROMPT.to_string(),
             sleep_time: DEFAULT_SLEEP_TIME,
+            silence_threshold: DEFAULT_SILENCE_THRESHOLD,
         }
     }
 }
@@ -182,5 +192,6 @@ mod tests {
         assert_eq!(config.continue_prompt, DEFAULT_CONTINUE_PROMPT);
         assert_eq!(config.retry_prompt, DEFAULT_RETRY_PROMPT);
         assert_eq!(config.sleep_time, DEFAULT_SLEEP_TIME);
+        assert_eq!(config.silence_threshold, DEFAULT_SILENCE_THRESHOLD);
     }
 }

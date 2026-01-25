@@ -5,8 +5,8 @@
 //! ## 功能
 //! - 使用portable-pty启动CLI进程
 //! - 双向IO转发：stdin -> PTY，PTY -> stdout
+//! - 跟踪最后活动时间（输入/输出）用于静默检测
 //! - 确保用户可以正常操作CLI
-//! - 支持向CLI发送输入（提示词）
 //!
 //! ## 跨平台支持
 //! - Windows: 使用ConPTY
@@ -19,7 +19,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// IO转发线程句柄
 ///
@@ -36,6 +36,7 @@ pub struct IoHandles {
 ///
 /// 负责启动CLI进程并管理其生命周期。
 /// 使用PTY来保持CLI的完整交互性。
+/// 跟踪最后活动时间用于静默检测。
 pub struct Runner {
     /// PTY pair（主端和从端）
     pty_pair: PtyPair,
@@ -51,6 +52,10 @@ pub struct Runner {
 
     /// 子进程的退出状态
     exit_status: Arc<Mutex<Option<portable_pty::ExitStatus>>>,
+
+    /// 最后活动时间（输入或输出）
+    /// 用于检测CLI是否处于静默状态（等待输入）
+    last_activity_time: Arc<Mutex<Instant>>,
 }
 
 impl Runner {
@@ -66,11 +71,6 @@ impl Runner {
     /// # 错误
     /// - 无法创建PTY
     /// - 无法启动CLI进程
-    ///
-    /// # 示例
-    /// ```
-    /// let runner = Runner::new("claude", &["--resume"])?;
-    /// ```
     pub fn new(cli: &str, args: &[String]) -> Result<Self> {
         // 获取原生PTY系统
         let pty_system = native_pty_system();
@@ -106,6 +106,7 @@ impl Runner {
 
         let running = Arc::new(AtomicBool::new(true));
         let exit_status = Arc::new(Mutex::new(None));
+        let last_activity_time = Arc::new(Mutex::new(Instant::now()));
 
         Ok(Runner {
             pty_pair: pair,
@@ -113,6 +114,7 @@ impl Runner {
             child,
             running,
             exit_status,
+            last_activity_time,
         })
     }
 
@@ -122,6 +124,8 @@ impl Runner {
     /// 1. 输出转发：PTY -> stdout（显示CLI输出）
     /// 2. 输入转发：stdin -> PTY（用户输入到CLI）
     ///
+    /// 每次有输入或输出时，都会更新最后活动时间。
+    ///
     /// # 返回值
     /// 返回包含两个线程句柄的IoHandles结构
     pub fn start_io_forwarding(&mut self) -> Result<IoHandles> {
@@ -130,6 +134,10 @@ impl Runner {
 
         let running_output = self.running.clone();
         let running_input = self.running.clone();
+
+        // 获取最后活动时间的共享引用
+        let last_activity_output = self.last_activity_time.clone();
+        let last_activity_input = self.last_activity_time.clone();
 
         // 获取PTY读取器
         let mut reader = self
@@ -142,6 +150,7 @@ impl Runner {
         let writer = self.writer.clone();
 
         // 启动输出转发线程：PTY -> stdout
+        // 每次有输出时更新最后活动时间
         let output_handle = thread::spawn(move || {
             let mut stdout = std::io::stdout();
             let mut buffer = [0u8; 4096];
@@ -153,6 +162,11 @@ impl Runner {
                         break;
                     }
                     Ok(n) => {
+                        // 更新最后活动时间（有输出）
+                        if let Ok(mut time) = last_activity_output.lock() {
+                            *time = Instant::now();
+                        }
+
                         // 将数据写入stdout
                         if stdout.write_all(&buffer[..n]).is_err() {
                             break;
@@ -172,6 +186,7 @@ impl Runner {
         });
 
         // 启动输入转发线程：stdin -> PTY
+        // 每次有输入时更新最后活动时间
         let input_handle = thread::spawn(move || {
             let mut stdin = std::io::stdin();
             let mut buffer = [0u8; 1024];
@@ -187,6 +202,11 @@ impl Runner {
                                 break;
                             }
                             Ok(n) => {
+                                // 更新最后活动时间（有输入）
+                                if let Ok(mut time) = last_activity_input.lock() {
+                                    *time = Instant::now();
+                                }
+
                                 // 将数据写入PTY
                                 if let Ok(mut w) = writer.lock() {
                                     if w.write_all(&buffer[..n]).is_err() {
@@ -226,13 +246,13 @@ impl Runner {
     ///
     /// # 返回值
     /// 成功返回Ok(())，失败返回错误
-    ///
-    /// # 示例
-    /// ```
-    /// runner.send_input("继续\n")?;
-    /// ```
     pub fn send_input(&mut self, input: &str) -> Result<()> {
         let mut writer = self.writer.lock().map_err(|_| anyhow::anyhow!("无法获取写入器锁"))?;
+
+        // 更新最后活动时间（程序发送输入也算活动）
+        if let Ok(mut time) = self.last_activity_time.lock() {
+            *time = Instant::now();
+        }
 
         // 写入输入
         writer
@@ -255,6 +275,27 @@ impl Runner {
     pub fn send_line(&mut self, line: &str) -> Result<()> {
         let input = format!("{}\n", line);
         self.send_input(&input)
+    }
+
+    /// 获取自上次活动以来的静默时间
+    ///
+    /// # 返回值
+    /// 返回自上次输入/输出以来经过的时间
+    pub fn get_silence_duration(&self) -> Duration {
+        if let Ok(time) = self.last_activity_time.lock() {
+            time.elapsed()
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// 重置活动时间为当前时间
+    ///
+    /// 当用户手动操作或其他事件发生时调用
+    pub fn reset_activity_time(&self) {
+        if let Ok(mut time) = self.last_activity_time.lock() {
+            *time = Instant::now();
+        }
     }
 
     /// 检查CLI进程是否仍在运行
@@ -355,6 +396,25 @@ mod tests {
         // 等待进程结束
         let status = runner.wait()?;
         assert!(is_success(&status));
+
+        Ok(())
+    }
+
+    /// 测试静默时间检测
+    #[test]
+    fn test_silence_duration() -> Result<()> {
+        let runner = Runner::new("cmd", &["/c".to_string(), "echo".to_string(), "test".to_string()])?;
+
+        // 刚创建时静默时间应该很短
+        let duration = runner.get_silence_duration();
+        assert!(duration < Duration::from_secs(1));
+
+        // 等待一秒
+        thread::sleep(Duration::from_secs(1));
+
+        // 静默时间应该增加
+        let duration = runner.get_silence_duration();
+        assert!(duration >= Duration::from_secs(1));
 
         Ok(())
     }
