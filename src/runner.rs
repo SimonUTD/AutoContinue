@@ -457,26 +457,14 @@ impl Runner {
         }
     }
 
-    /// 获取颜色调试信息
-    ///
-    /// 返回新增内容中所有非默认颜色的统计信息
-    /// 用于诊断颜色检测问题
-    pub fn get_color_debug_info(&self) -> String {
-        if let Ok(term) = self.terminal.lock() {
-            term.get_color_debug_info()
-        } else {
-            String::from("无法获取")
-        }
-    }
-
     /// 获取统计信息（用于调试）
     ///
-    /// 返回 (基线非空行数, 当前非空行数, 新增行数, 红色字符数, 最大连续红色)
-    pub fn get_red_stats(&self) -> (usize, usize, usize, usize, usize) {
+    /// 返回红色字符总数
+    pub fn get_red_stats(&self) -> usize {
         if let Ok(term) = self.terminal.lock() {
             term.get_red_stats()
         } else {
-            (0, 0, 0, 0, 0)
+            0
         }
     }
 

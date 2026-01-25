@@ -92,16 +92,6 @@ enum ParserState {
     Osc,
 }
 
-/// 红色文本片段（用于错误检测）
-#[derive(Debug)]
-struct RedSegment {
-    /// 片段内容
-    content: String,
-    /// 所在行号
-    #[allow(dead_code)]
-    row: usize,
-}
-
 /// 虚拟终端
 /// 维护终端屏幕缓冲区和状态，包含内置的 ANSI 解析器
 pub struct VirtualTerminal {
@@ -111,9 +101,6 @@ pub struct VirtualTerminal {
     pub height: usize,
     /// 屏幕缓冲区
     pub buffer: Vec<Vec<Cell>>,
-    /// 基线屏幕快照（用于差异比较）
-    /// 保存上一次 clear_new_content() 时的屏幕状态
-    baseline_buffer: Vec<Vec<Cell>>,
     /// 光标行
     pub cursor_row: usize,
     /// 光标列
@@ -151,12 +138,10 @@ impl VirtualTerminal {
     /// 创建新的虚拟终端
     pub fn new(width: usize, height: usize) -> Self {
         let buffer = vec![vec![Cell::default(); width]; height];
-        let baseline_buffer = vec![vec![Cell::default(); width]; height];
         VirtualTerminal {
             width,
             height,
             buffer,
-            baseline_buffer,
             cursor_row: 0,
             cursor_col: 0,
             saved_cursor_row: 0,
@@ -780,248 +765,67 @@ impl VirtualTerminal {
         }
     }
 
-    /// 检查是否有新增的红色内容
+    /// 检查是否有红色内容（错误检测）
     ///
-    /// 改进的算法：直接比较红色内容本身
-    /// 1. 提取基线屏幕中的所有红色文本片段
-    /// 2. 提取当前屏幕中的所有红色文本片段（忽略底部状态栏）
-    /// 3. 找出当前屏幕中存在但基线中不存在的红色片段
-    /// 4. 如果有足够长的新红色内容，判定为错误
+    /// 简单算法：统计屏幕中红色字符总数（忽略底部状态栏）
+    /// 如果红色字符超过阈值，判定为错误
     ///
-    /// 这种方式可以有效过滤固定的UI红色元素（它们在基线中已存在）
-    ///
-    /// 返回 true 表示检测到新增的错误
+    /// 返回 true 表示检测到错误
     pub fn has_red_content(&self) -> bool {
         const IGNORE_BOTTOM_ROWS: usize = 3;
-        const MIN_RED_CHARS: usize = 5;
+        const MIN_RED_CHARS: usize = 50;
 
         let check_height = self.height.saturating_sub(IGNORE_BOTTOM_ROWS);
 
-        // 提取基线和当前屏幕的红色文本片段
-        let baseline_red_segments = self.extract_red_segments(&self.baseline_buffer, check_height);
-        let current_red_segments = self.extract_red_segments(&self.buffer, check_height);
-
-        // 找出新增的红色片段（在当前但不在基线）
-        let mut max_new_segment_len = 0;
-
-        for seg in &current_red_segments {
-            // 检查这个红色片段是否是新的
-            // 如果基线中不存在相同内容的红色片段，则认为是新的
-            let is_new = !baseline_red_segments.iter().any(|bs| bs.content == seg.content);
-            if is_new {
-                max_new_segment_len = max_new_segment_len.max(seg.content.len());
-            }
-        }
-
-        max_new_segment_len >= MIN_RED_CHARS
-    }
-
-    /// 从缓冲区提取所有红色文本片段
-    fn extract_red_segments(&self, buffer: &[Vec<Cell>], height: usize) -> Vec<RedSegment> {
-        let mut segments = Vec::new();
-
-        for row in 0..height.min(buffer.len()) {
-            let mut current_segment = String::new();
-
-            for cell in &buffer[row] {
+        let mut total_red = 0;
+        for row in 0..check_height {
+            for cell in &self.buffer[row] {
                 if cell.fg.is_red() && cell.ch != ' ' {
-                    current_segment.push(cell.ch);
-                } else if !current_segment.is_empty() {
-                    // 片段结束，保存
-                    segments.push(RedSegment {
-                        content: current_segment.clone(),
-                        row,
-                    });
-                    current_segment.clear();
-                }
-            }
-
-            // 行末的片段
-            if !current_segment.is_empty() {
-                segments.push(RedSegment {
-                    content: current_segment,
-                    row,
-                });
-            }
-        }
-
-        segments
-    }
-
-    /// 提取非空行的内容和行号
-    /// 返回 Vec<(行号, 行内容)>
-    fn extract_nonempty_lines(&self, buffer: &[Vec<Cell>], height: usize) -> Vec<(usize, String)> {
-        let mut result = Vec::new();
-        for row in 0..height.min(buffer.len()) {
-            let line: String = buffer[row]
-                .iter()
-                .map(|c| c.ch)
-                .collect::<String>()
-                .trim()
-                .to_string();
-            // 只保留非空行
-            if !line.is_empty() {
-                result.push((row, line));
-            }
-        }
-        result
-    }
-
-    /// 使用 LCS 算法找出新增的行号
-    fn find_new_rows(&self, baseline: &[(usize, String)], current: &[(usize, String)]) -> Vec<usize> {
-        let baseline_contents: Vec<&str> = baseline.iter().map(|(_, s)| s.as_str()).collect();
-        let current_contents: Vec<&str> = current.iter().map(|(_, s)| s.as_str()).collect();
-
-        let m = baseline_contents.len();
-        let n = current_contents.len();
-
-        if m == 0 {
-            // 基线为空，所有当前行都是新的
-            return current.iter().map(|(row, _)| *row).collect();
-        }
-
-        if n == 0 {
-            return Vec::new();
-        }
-
-        // 计算 LCS 长度表
-        let mut dp = vec![vec![0usize; n + 1]; m + 1];
-        for i in 1..=m {
-            for j in 1..=n {
-                if baseline_contents[i - 1] == current_contents[j - 1] {
-                    dp[i][j] = dp[i - 1][j - 1] + 1;
-                } else {
-                    dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+                    total_red += 1;
                 }
             }
         }
 
-        // 回溯找出 LCS 中的当前列表索引
-        let mut lcs_current_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut i = m;
-        let mut j = n;
-        while i > 0 && j > 0 {
-            if baseline_contents[i - 1] == current_contents[j - 1] {
-                lcs_current_indices.insert(j - 1);
-                i -= 1;
-                j -= 1;
-            } else if dp[i - 1][j] > dp[i][j - 1] {
-                i -= 1;
-            } else {
-                j -= 1;
-            }
-        }
-
-        // 不在 LCS 中的行就是新增的，返回实际行号
-        current
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| !lcs_current_indices.contains(idx))
-            .map(|(_, (row, _))| *row)
-            .collect()
+        total_red >= MIN_RED_CHARS
     }
 
-    /// 获取新增的红色文本
+    /// 获取红色文本内容
     pub fn get_red_content(&self) -> String {
         const IGNORE_BOTTOM_ROWS: usize = 3;
         let check_height = self.height.saturating_sub(IGNORE_BOTTOM_ROWS);
 
-        let baseline_red_segments = self.extract_red_segments(&self.baseline_buffer, check_height);
-        let current_red_segments = self.extract_red_segments(&self.buffer, check_height);
-
-        // 收集新增的红色内容
         let mut result = String::new();
-        for seg in &current_red_segments {
-            let is_new = !baseline_red_segments.iter().any(|bs| bs.content == seg.content);
-            if is_new {
-                if !result.is_empty() {
-                    result.push(' ');
+        for row in 0..check_height {
+            for cell in &self.buffer[row] {
+                if cell.fg.is_red() && cell.ch != ' ' {
+                    result.push(cell.ch);
                 }
-                result.push_str(&seg.content);
             }
         }
         result
     }
 
     /// 获取统计信息（用于调试）
-    /// 返回 (基线红色片段数, 当前红色片段数, 新增红色片段数, 新增红色字符数, 最大新片段长度)
-    pub fn get_red_stats(&self) -> (usize, usize, usize, usize, usize) {
+    /// 返回红色字符总数
+    pub fn get_red_stats(&self) -> usize {
         const IGNORE_BOTTOM_ROWS: usize = 3;
         let check_height = self.height.saturating_sub(IGNORE_BOTTOM_ROWS);
 
-        let baseline_red_segments = self.extract_red_segments(&self.baseline_buffer, check_height);
-        let current_red_segments = self.extract_red_segments(&self.buffer, check_height);
-
-        let mut new_segment_count = 0;
-        let mut new_red_chars = 0;
-        let mut max_new_segment_len = 0;
-
-        for seg in &current_red_segments {
-            let is_new = !baseline_red_segments.iter().any(|bs| bs.content == seg.content);
-            if is_new {
-                new_segment_count += 1;
-                new_red_chars += seg.content.len();
-                max_new_segment_len = max_new_segment_len.max(seg.content.len());
-            }
-        }
-
-        (
-            baseline_red_segments.len(),
-            current_red_segments.len(),
-            new_segment_count,
-            new_red_chars,
-            max_new_segment_len,
-        )
-    }
-
-    /// 获取新增内容中所有非默认颜色的调试信息（差异法）
-    /// 用于诊断颜色检测问题
-    pub fn get_color_debug_info(&self) -> String {
-        use std::collections::HashMap;
-        let mut color_counts: HashMap<String, usize> = HashMap::new();
-
-        for row in 0..self.height {
-            for col in 0..self.width {
-                let current = &self.buffer[row][col];
-                let baseline = &self.baseline_buffer[row][col];
-
-                let is_different = current.ch != baseline.ch || current.fg != baseline.fg;
-
-                if is_different && current.fg != Color::Default && current.ch != ' ' {
-                    let key = format!("{:?}", current.fg);
-                    *color_counts.entry(key).or_insert(0) += 1;
+        let mut total_red = 0;
+        for row in 0..check_height {
+            for cell in &self.buffer[row] {
+                if cell.fg.is_red() && cell.ch != ' ' {
+                    total_red += 1;
                 }
             }
         }
-
-        if color_counts.is_empty() {
-            return String::from("无新增颜色内容");
-        }
-
-        color_counts
-            .into_iter()
-            .map(|(color, count)| format!("{}({})", color, count))
-            .collect::<Vec<_>>()
-            .join(", ")
+        total_red
     }
 
     /// 清除新增内容追踪器（在发送提示词后调用）
-    /// 保存当前屏幕作为新的基线快照，用于下一次差异比较
     pub fn clear_new_content(&mut self) {
-        // 保存当前屏幕作为基线（用于差异比较）
-        self.baseline_buffer = self.buffer.clone();
-
-        // 清除旧的追踪器（兼容性保留）
         self.new_content.clear();
         self.has_new_content = false;
-
-        // 重置颜色状态，避免CLI未重置颜色导致后续误判
-        self.current_fg = Color::Default;
-        self.current_bg = Color::Default;
-        self.current_bold = false;
-
-        // 重置解析器状态，避免中间状态影响后续解析
-        self.reset_parser();
     }
 
     /// 检查是否有新内容
@@ -1073,11 +877,11 @@ mod tests {
     #[test]
     fn test_red_detection() {
         let mut term = VirtualTerminal::new(80, 24);
-        // ESC[31m = 红色前景
-        term.process(b"\x1b[31mError\x1b[0m");
+        // ESC[31m = 红色前景，写入超过50个红色字符
+        term.process(b"\x1b[31mError: This is a long error message with more than 50 characters\x1b[0m");
 
         assert!(term.has_red_content());
-        assert_eq!(term.get_red_content(), "Error");
+        assert!(term.get_red_content().len() >= 50);
     }
 
     #[test]
