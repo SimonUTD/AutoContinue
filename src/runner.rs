@@ -7,12 +7,11 @@
 //! - 双向IO转发：stdin -> PTY，PTY -> stdout
 //! - 跟踪最后活动时间（输入/输出）用于静默检测
 //! - 虚拟终端追踪输出内容，用于错误检测
-//! - 智能鼠标模式：检测子进程的鼠标模式，只在需要时转发鼠标事件
 //! - 确保用户可以正常操作CLI
 //!
 //! ## 跨平台支持
-//! - Windows: 使用ConPTY，必须使用 ReadConsoleInput 来读取鼠标事件
-//! - Unix/Linux/macOS: 使用传统PTY，鼠标事件通过 ANSI 序列传输
+//! - Windows: 使用ConPTY
+//! - Unix/Linux/macOS: 使用传统PTY
 
 use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -162,27 +161,19 @@ impl Runner {
     /// 启动双向IO转发线程
     ///
     /// 该方法启动两个后台线程：
-    /// 1. 输出转发：PTY -> stdout（显示CLI输出）+ 鼠标模式检测 + 虚拟终端处理
+    /// 1. 输出转发：PTY -> stdout（显示CLI输出）+ 虚拟终端处理
     /// 2. 输入转发：stdin -> PTY（用户输入到CLI）
     ///
-    /// ## 鼠标处理策略
-    /// - 启用 crossterm 的鼠标捕获（在 Windows 上设置 ENABLE_MOUSE_INPUT）
-    /// - 检测子进程是否启用了鼠标模式（通过分析输出中的 ANSI 序列）
-    /// - 只有当子进程启用了鼠标模式时，才将鼠标事件转发到 PTY
-    /// - 这样可以避免在子进程没准备好时发送鼠标数据导致乱码
-    ///
-    /// ## 为什么必须使用 crossterm 事件系统
-    /// 在 Windows 上，stdin.read() 使用 ReadFile，它会丢弃鼠标事件。
-    /// 只有 ReadConsoleInput 才能读取鼠标事件，而 crossterm 使用它。
+    /// 每次有输入或输出时，都会更新最后活动时间。
+    /// 输出数据同时被送入虚拟终端进行解析和错误检测。
     ///
     /// # 返回值
     /// 返回包含两个线程句柄的IoHandles结构
     pub fn start_io_forwarding(&mut self) -> Result<IoHandles> {
-        // 启用终端原始模式
+        // 启用终端原始模式，以便直接获取用户输入
         let _ = terminal::enable_raw_mode();
 
-        // 启用鼠标捕获 - 在 Windows 上这会设置 ENABLE_MOUSE_INPUT
-        // 这是必需的，因为 Windows 的 ReadFile 会丢弃鼠标事件
+        // 启用鼠标捕获，以便转发鼠标事件到CLI
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::EnableMouseCapture
@@ -194,12 +185,6 @@ impl Runner {
         // 获取最后活动时间的共享引用
         let last_activity_output = self.last_activity_time.clone();
         let last_activity_input = self.last_activity_time.clone();
-
-        // 子进程是否启用了鼠标模式的标志
-        // 只有当子进程启用了鼠标模式时，才转发鼠标事件
-        let mouse_mode_enabled = Arc::new(AtomicBool::new(false));
-        let mouse_mode_for_output = mouse_mode_enabled.clone();
-        let mouse_mode_for_input = mouse_mode_enabled.clone();
 
         // 获取PTY读取器
         let mut reader = self
@@ -219,7 +204,8 @@ impl Runner {
         // 获取虚拟终端的共享引用
         let terminal = self.terminal.clone();
 
-        // 启动输出转发线程：PTY -> stdout + 鼠标模式检测 + 虚拟终端处理
+        // 启动输出转发线程：PTY -> stdout + 虚拟终端
+        // 每次有输出时更新最后活动时间，并送入虚拟终端处理
         let output_handle = thread::spawn(move || {
             let mut stdout = std::io::stdout();
             let mut buffer = [0u8; 4096];
@@ -231,46 +217,38 @@ impl Runner {
                         break;
                     }
                     Ok(n) => {
-                        let data = &buffer[..n];
-
                         // 更新最后活动时间（有输出）
                         if let Ok(mut time) = last_activity_output.lock() {
                             *time = Instant::now();
                         }
 
-                        // 检测鼠标模式启用/禁用序列
-                        // 启用序列：\x1b[?1000h, \x1b[?1002h, \x1b[?1003h, \x1b[?1006h
-                        // 禁用序列：\x1b[?1000l, \x1b[?1002l, \x1b[?1003l, \x1b[?1006l
-                        if contains_mouse_enable_sequence(data) {
-                            mouse_mode_for_output.store(true, Ordering::SeqCst);
-                        }
-                        if contains_mouse_disable_sequence(data) {
-                            mouse_mode_for_output.store(false, Ordering::SeqCst);
-                        }
-
                         // 将数据送入虚拟终端处理（用于错误检测）
                         if let Ok(mut term) = terminal.lock() {
-                            term.process(data);
+                            term.process(&buffer[..n]);
                         }
 
                         // 将数据写入stdout
-                        if stdout.write_all(data).is_err() {
+                        if stdout.write_all(&buffer[..n]).is_err() {
                             break;
                         }
                         let _ = stdout.flush();
                     }
                     Err(e) => {
+                        // 检查是否是非阻塞读取导致的暂时性错误
                         if e.kind() != std::io::ErrorKind::WouldBlock {
                             break;
                         }
+                        // 短暂休眠避免忙等待
                         thread::sleep(Duration::from_millis(10));
                     }
                 }
             }
         });
 
-        // 启动输入转发线程：使用 crossterm 事件系统读取输入
-        // 必须使用 crossterm 因为 Windows 的 ReadFile 会丢弃鼠标事件
+        // 启动输入转发线程：stdin -> PTY
+        // 使用crossterm的event系统正确处理特殊键（方向键、ESC等）
+        // 每次有输入时更新最后活动时间
+        // 同时检查注入的输入（通过channel）
         let input_handle = thread::spawn(move || {
             while running_input.load(Ordering::SeqCst) {
                 // 首先检查是否有注入的输入
@@ -288,16 +266,20 @@ impl Runner {
                     }
                 }
 
-                // 使用 crossterm 的事件系统读取输入
+                // 使用crossterm的event poll来非阻塞检测输入
                 match crossterm::event::poll(Duration::from_millis(50)) {
                     Ok(true) => {
+                        // 有事件可读，使用crossterm读取事件
                         match crossterm::event::read() {
-                            Ok(Event::Key(key_event)) => {
-                                // 键盘事件：总是转发
-                                if let Some(bytes) = key_event_to_bytes(&key_event) {
+                            Ok(event) => {
+                                // 将事件转换为字节序列
+                                if let Some(bytes) = event_to_bytes(&event) {
+                                    // 更新最后活动时间（有输入）
                                     if let Ok(mut time) = last_activity_input.lock() {
                                         *time = Instant::now();
                                     }
+
+                                    // 将数据写入PTY
                                     if let Ok(mut w) = writer.lock() {
                                         if w.write_all(&bytes).is_err() {
                                             break;
@@ -306,39 +288,8 @@ impl Runner {
                                     }
                                 }
                             }
-                            Ok(Event::Mouse(mouse_event)) => {
-                                // 鼠标事件：只有当子进程启用了鼠标模式时才转发
-                                if mouse_mode_for_input.load(Ordering::SeqCst) {
-                                    if let Some(bytes) = mouse_event_to_bytes(&mouse_event) {
-                                        if let Ok(mut time) = last_activity_input.lock() {
-                                            *time = Instant::now();
-                                        }
-                                        if let Ok(mut w) = writer.lock() {
-                                            if w.write_all(&bytes).is_err() {
-                                                break;
-                                            }
-                                            let _ = w.flush();
-                                        }
-                                    }
-                                }
-                                // 如果子进程没有启用鼠标模式，丢弃鼠标事件
-                            }
-                            Ok(Event::Paste(text)) => {
-                                // 粘贴事件：总是转发
-                                if let Ok(mut time) = last_activity_input.lock() {
-                                    *time = Instant::now();
-                                }
-                                if let Ok(mut w) = writer.lock() {
-                                    if w.write_all(text.as_bytes()).is_err() {
-                                        break;
-                                    }
-                                    let _ = w.flush();
-                                }
-                            }
-                            Ok(_) => {
-                                // 忽略其他事件（窗口大小变化等）
-                            }
                             Err(_) => {
+                                // 读取事件出错，短暂休眠后继续
                                 thread::sleep(Duration::from_millis(10));
                             }
                         }
@@ -347,6 +298,7 @@ impl Runner {
                         // 没有事件，继续循环
                     }
                     Err(_) => {
+                        // poll出错，短暂休眠后继续
                         thread::sleep(Duration::from_millis(10));
                     }
                 }
@@ -497,62 +449,46 @@ impl Runner {
     }
 }
 
-/// 检测数据中是否包含鼠标模式启用序列
+/// 将crossterm事件转换为PTY可接受的字节序列
 ///
-/// 检测的序列：
-/// - \x1b[?1000h - 基本鼠标报告
-/// - \x1b[?1002h - 按钮事件跟踪
-/// - \x1b[?1003h - 任意事件跟踪
-/// - \x1b[?1006h - SGR 扩展模式
-fn contains_mouse_enable_sequence(data: &[u8]) -> bool {
-    // 搜索模式：ESC [ ? <数字> h
-    let patterns = [
-        b"\x1b[?1000h".as_slice(),
-        b"\x1b[?1002h".as_slice(),
-        b"\x1b[?1003h".as_slice(),
-        b"\x1b[?1006h".as_slice(),
-    ];
-
-    for pattern in patterns {
-        if data.windows(pattern.len()).any(|w| w == pattern) {
-            return true;
-        }
-    }
-    false
-}
-
-/// 检测数据中是否包含鼠标模式禁用序列
+/// 该函数处理键盘事件、鼠标事件和粘贴事件，将它们转换为
+/// 相应的ANSI转义序列或UTF-8字节。
 ///
-/// 检测的序列：
-/// - \x1b[?1000l - 禁用基本鼠标报告
-/// - \x1b[?1002l - 禁用按钮事件跟踪
-/// - \x1b[?1003l - 禁用任意事件跟踪
-/// - \x1b[?1006l - 禁用 SGR 扩展模式
-fn contains_mouse_disable_sequence(data: &[u8]) -> bool {
-    let patterns = [
-        b"\x1b[?1000l".as_slice(),
-        b"\x1b[?1002l".as_slice(),
-        b"\x1b[?1003l".as_slice(),
-        b"\x1b[?1006l".as_slice(),
-    ];
-
-    for pattern in patterns {
-        if data.windows(pattern.len()).any(|w| w == pattern) {
-            return true;
+/// # 参数
+/// - `event`: crossterm事件
+///
+/// # 返回值
+/// 如果是支持的事件类型，返回对应的字节序列；否则返回None
+fn event_to_bytes(event: &Event) -> Option<Vec<u8>> {
+    match event {
+        Event::Key(key_event) => key_event_to_bytes(key_event),
+        Event::Mouse(mouse_event) => mouse_event_to_bytes(mouse_event),
+        Event::Paste(text) => {
+            // 粘贴事件，直接返回文本的UTF-8字节
+            Some(text.as_bytes().to_vec())
         }
+        _ => None, // 忽略其他事件（窗口大小变化等）
     }
-    false
 }
 
 /// 将鼠标事件转换为字节序列（SGR编码格式）
 ///
-/// 使用 SGR 扩展鼠标编码格式：CSI < Cb ; Cx ; Cy M/m
+/// 使用SGR扩展鼠标编码格式：CSI < Cb ; Cx ; Cy M/m
+/// 这是现代终端普遍支持的格式，支持大于223的坐标
+///
+/// # 参数
+/// - `mouse_event`: 鼠标事件
+///
+/// # 返回值
+/// 返回SGR格式的鼠标转义序列
 fn mouse_event_to_bytes(mouse_event: &crossterm::event::MouseEvent) -> Option<Vec<u8>> {
     use crossterm::event::{MouseButton, MouseEventKind};
 
     let crossterm::event::MouseEvent { kind, column, row, modifiers } = mouse_event;
 
-    // 计算按钮码
+    // 计算按钮码（基础值）
+    // 0 = 左键, 1 = 中键, 2 = 右键
+    // 加上修饰符：+4 Shift, +8 Alt, +16 Ctrl
     let mut cb: u8 = match kind {
         MouseEventKind::Down(MouseButton::Left) => 0,
         MouseEventKind::Down(MouseButton::Middle) => 1,
@@ -560,10 +496,10 @@ fn mouse_event_to_bytes(mouse_event: &crossterm::event::MouseEvent) -> Option<Ve
         MouseEventKind::Up(MouseButton::Left) => 0,
         MouseEventKind::Up(MouseButton::Middle) => 1,
         MouseEventKind::Up(MouseButton::Right) => 2,
-        MouseEventKind::Drag(MouseButton::Left) => 32,
-        MouseEventKind::Drag(MouseButton::Middle) => 33,
-        MouseEventKind::Drag(MouseButton::Right) => 34,
-        MouseEventKind::Moved => 35,
+        MouseEventKind::Drag(MouseButton::Left) => 32,      // 移动 + 左键
+        MouseEventKind::Drag(MouseButton::Middle) => 33,    // 移动 + 中键
+        MouseEventKind::Drag(MouseButton::Right) => 34,     // 移动 + 右键
+        MouseEventKind::Moved => 35,                         // 纯移动（无按键）
         MouseEventKind::ScrollUp => 64,
         MouseEventKind::ScrollDown => 65,
         MouseEventKind::ScrollLeft => 66,
@@ -581,22 +517,36 @@ fn mouse_event_to_bytes(mouse_event: &crossterm::event::MouseEvent) -> Option<Ve
         cb += 16;
     }
 
+    // 坐标（1-based）
     let cx = column + 1;
     let cy = row + 1;
 
+    // 判断是按下还是释放
     let suffix = match kind {
-        MouseEventKind::Up(_) => 'm',
-        _ => 'M',
+        MouseEventKind::Up(_) => 'm',  // 释放
+        _ => 'M',                       // 按下/移动/滚动
     };
 
+    // 生成SGR格式：ESC [ < Cb ; Cx ; Cy M/m
     Some(format!("\x1b[<{};{};{}{}", cb, cx, cy, suffix).into_bytes())
 }
 
 /// 将键盘事件转换为字节序列
+///
+/// # 参数
+/// - `key_event`: 键盘事件
+///
+/// # 返回值
+/// 返回对应的字节序列
+///
+/// # 注意
+/// 只处理 KeyEventKind::Press 事件，忽略 Release 事件
+/// 这是因为Windows上crossterm会同时报告按下和释放事件
 fn key_event_to_bytes(key_event: &KeyEvent) -> Option<Vec<u8>> {
     let KeyEvent { code, modifiers, kind, .. } = key_event;
 
-    // 只处理按键按下事件
+    // 只处理按键按下事件，忽略释放事件（避免重复输入）
+    // Windows上crossterm会报告Press和Release两个事件
     if *kind != KeyEventKind::Press && *kind != KeyEventKind::Repeat {
         return None;
     }
@@ -604,14 +554,16 @@ fn key_event_to_bytes(key_event: &KeyEvent) -> Option<Vec<u8>> {
     // 处理Ctrl组合键
     if modifiers.contains(KeyModifiers::CONTROL) {
         return match code {
-            KeyCode::Char('[') => Some(vec![0x1B]),
+            // 特殊的Ctrl组合键
+            KeyCode::Char('[') => Some(vec![0x1B]), // Ctrl+[ = ESC
             KeyCode::Char('\\') => Some(vec![0x1C]),
             KeyCode::Char(']') => Some(vec![0x1D]),
             KeyCode::Char('^') => Some(vec![0x1E]),
             KeyCode::Char('_') => Some(vec![0x1F]),
+            // Ctrl+A 到 Ctrl+Z 映射到 0x01 到 0x1A
             KeyCode::Char(c) => {
                 let ctrl_char = (*c as u8).to_ascii_lowercase();
-                if (b'a'..=b'z').contains(&ctrl_char) {
+                if ctrl_char >= b'a' && ctrl_char <= b'z' {
                     Some(vec![ctrl_char - b'a' + 1])
                 } else {
                     None
@@ -621,22 +573,42 @@ fn key_event_to_bytes(key_event: &KeyEvent) -> Option<Vec<u8>> {
         };
     }
 
+    // 处理普通键和特殊键
     match code {
+        // 普通字符
         KeyCode::Char(c) => Some(c.to_string().into_bytes()),
+
+        // 回车键 - 发送 \r
         KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Backspace => Some(vec![0x7F]),
+
+        // 退格键
+        KeyCode::Backspace => Some(vec![0x7F]), // DEL
+
+        // Tab键
         KeyCode::Tab => Some(vec![b'\t']),
+
+        // ESC键
         KeyCode::Esc => Some(vec![0x1B]),
+
+        // 方向键（ANSI转义序列）
         KeyCode::Up => Some(vec![0x1B, b'[', b'A']),
         KeyCode::Down => Some(vec![0x1B, b'[', b'B']),
         KeyCode::Right => Some(vec![0x1B, b'[', b'C']),
         KeyCode::Left => Some(vec![0x1B, b'[', b'D']),
+
+        // Home/End键
         KeyCode::Home => Some(vec![0x1B, b'[', b'H']),
         KeyCode::End => Some(vec![0x1B, b'[', b'F']),
+
+        // Insert/Delete键
         KeyCode::Insert => Some(vec![0x1B, b'[', b'2', b'~']),
         KeyCode::Delete => Some(vec![0x1B, b'[', b'3', b'~']),
+
+        // Page Up/Down键
         KeyCode::PageUp => Some(vec![0x1B, b'[', b'5', b'~']),
         KeyCode::PageDown => Some(vec![0x1B, b'[', b'6', b'~']),
+
+        // 功能键 F1-F12
         KeyCode::F(1) => Some(vec![0x1B, b'O', b'P']),
         KeyCode::F(2) => Some(vec![0x1B, b'O', b'Q']),
         KeyCode::F(3) => Some(vec![0x1B, b'O', b'R']),
@@ -649,6 +621,8 @@ fn key_event_to_bytes(key_event: &KeyEvent) -> Option<Vec<u8>> {
         KeyCode::F(10) => Some(vec![0x1B, b'[', b'2', b'1', b'~']),
         KeyCode::F(11) => Some(vec![0x1B, b'[', b'2', b'3', b'~']),
         KeyCode::F(12) => Some(vec![0x1B, b'[', b'2', b'4', b'~']),
+
+        // 其他未处理的键
         _ => None,
     }
 }
