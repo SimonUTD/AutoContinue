@@ -339,10 +339,17 @@ impl Runner {
     /// # 返回值
     /// 成功返回Ok(())，失败返回错误
     pub fn send_line(&mut self, line: &str) -> Result<()> {
-        // 把文本和回车一起发送，确保是原子操作
-        // 避免分开发送导致的竞态条件（长prompt时回车可能变成换行）
-        let input_with_cr = format!("{}\r", line);
-        self.send_input(&input_with_cr)
+        // 发送文本内容（直接写入PTY）
+        self.send_input(line)?;
+
+        // 发送回车通过 channel，让输入线程发送
+        // 这样回车和用户按Enter走同样的路径
+        if let Some(ref sender) = self.inject_sender {
+            // 发送 \r（与 key_event_to_bytes 中 Enter 键一致）
+            let _ = sender.send(vec![b'\r']);
+        }
+
+        Ok(())
     }
 
     /// 获取自上次活动以来的静默时间
