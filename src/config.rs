@@ -31,6 +31,9 @@ pub const DEFAULT_SLEEP_TIME: u64 = 15;
 /// 默认的静默阈值（秒）
 pub const DEFAULT_SILENCE_THRESHOLD: u64 = 30;
 
+/// 默认的最大轮次限制（-1 表示无限制）
+pub const DEFAULT_LIMIT: i64 = -1;
+
 /// AutoContinue配置结构体
 ///
 /// 该结构体包含所有运行时需要的配置信息。
@@ -71,6 +74,11 @@ pub struct Config {
     /// CLI无输入/输出超过此时间后开始计算等待时间
     /// 总等待时间 = 静默阈值 + 等待时间
     pub silence_threshold: u64,
+
+    /// 最大自动发送轮次限制
+    /// -1 表示无限制，正数表示最大发送次数
+    /// 达到限制后程序将停止自动发送并退出
+    pub limit: i64,
 }
 
 impl Config {
@@ -150,6 +158,7 @@ impl Config {
             retry_prompt_io,
             sleep_time: args.sleep_time,
             silence_threshold: args.silence_threshold,
+            limit: args.limit,
         })
     }
 
@@ -269,6 +278,7 @@ impl Default for Config {
             retry_prompt_io: None,
             sleep_time: DEFAULT_SLEEP_TIME,
             silence_threshold: DEFAULT_SILENCE_THRESHOLD,
+            limit: DEFAULT_LIMIT,
         }
     }
 }
@@ -331,5 +341,6 @@ mod tests {
         assert_eq!(config.retry_prompt, DEFAULT_RETRY_PROMPT);
         assert_eq!(config.sleep_time, DEFAULT_SLEEP_TIME);
         assert_eq!(config.silence_threshold, DEFAULT_SILENCE_THRESHOLD);
+        assert_eq!(config.limit, DEFAULT_LIMIT);
     }
 }

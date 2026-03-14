@@ -42,6 +42,7 @@ ac claude -cpio prompt.md
 | `-rpio, --retry-prompt-io` | 重试提示词IO文件（动态读取） | - |
 | `-st, --sleep-time` | 额外等待时间（秒） | 15 |
 | `-sth, --silence-threshold` | 静默阈值（秒） | 30 |
+| `-l, --limit` | 最大自动发送轮次（-1为无限制） | -1 |
 | `-h, --help` | 显示帮助 | - |
 | `-v, --version` | 显示版本 | - |
 

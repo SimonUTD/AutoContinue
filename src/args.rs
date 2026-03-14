@@ -45,6 +45,8 @@ const AC_ARGS_WITH_VALUE: &[&str] = &[
     "-st", "--st", "--sleep-time",
     // silence-threshold
     "-sth", "--sth", "--silence-threshold",
+    // limit (最大轮次)
+    "-l", "--l", "--limit",
 ];
 
 /// AC参数名称列表（不带值的参数）
@@ -55,7 +57,7 @@ const AC_ARGS_NO_VALUE: &[&str] = &[
 
 /// AC特有的短参数列表（需要转换为双横线格式）
 /// 这些参数支持单横线格式（如 -cp）但会被转换为双横线格式（如 --cp）
-const AC_SHORT_ARGS: &[&str] = &["-cp", "-cpf", "-cpio", "-rp", "-rpf", "-rpio", "-st", "-sth"];
+const AC_SHORT_ARGS: &[&str] = &["-cp", "-cpf", "-cpio", "-rp", "-rpf", "-rpio", "-st", "-sth", "-l"];
 
 /// AutoContinue (AC) - 自动继续/重试CLI工具的包装器
 ///
@@ -110,6 +112,12 @@ pub struct Args {
     /// 默认30秒，总等待时间 = 静默阈值 + 等待时间
     #[arg(long = "silence-threshold", visible_alias = "sth", value_name = "SECONDS", default_value = "30")]
     pub silence_threshold: u64,
+
+    /// 最大自动发送轮次限制
+    /// 达到限制后程序将停止自动发送并退出
+    /// 默认 -1 表示无限制
+    #[arg(long = "limit", visible_alias = "l", value_name = "COUNT", default_value = "-1", allow_hyphen_values = true)]
+    pub limit: i64,
 
     /// 传递给CLI程序的其他参数
     /// 这些参数会原样传递给CLI程序
@@ -352,6 +360,36 @@ mod tests {
         assert_eq!(args.continue_prompt, Some("继续".to_string()));
         assert_eq!(args.retry_prompt, Some("重试".to_string()));
         assert_eq!(args.sleep_time, 20);
+        assert!(args.cli_args.iter().any(|a| a == "--resume"));
+    }
+
+    /// 测试 limit 参数默认值为 -1（无限制）
+    #[test]
+    fn test_limit_default() {
+        let args = parse_args_from(["ac", "claude"]);
+        assert_eq!(args.limit, -1);
+    }
+
+    /// 测试 limit 参数使用短格式 -l
+    #[test]
+    fn test_limit_short_flag() {
+        let args = parse_args_from(["ac", "claude", "-l", "5"]);
+        assert_eq!(args.limit, 5);
+    }
+
+    /// 测试 limit 参数使用长格式 --limit
+    #[test]
+    fn test_limit_long_flag() {
+        let args = parse_args_from(["ac", "claude", "--limit", "10"]);
+        assert_eq!(args.limit, 10);
+    }
+
+    /// 测试 limit 参数放在 CLI 参数之前
+    #[test]
+    fn test_limit_before_cli() {
+        let args = parse_args_from(["ac", "-l", "3", "claude", "--resume"]);
+        assert_eq!(args.cli, "claude");
+        assert_eq!(args.limit, 3);
         assert!(args.cli_args.iter().any(|a| a == "--resume"));
     }
 }

@@ -80,6 +80,13 @@ fn print_banner(config: &Config) {
     // 创建检测器以显示类型
     let detector = create_detector(&config.cli);
 
+    // 获取轮次限制显示文本
+    let limit_display = if config.limit < 0 {
+        "无限制".to_string()
+    } else {
+        format!("{} 次", config.limit)
+    };
+
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║           AutoContinue (AC) v{}                        ║", VERSION);
     println!("╠══════════════════════════════════════════════════════════╣");
@@ -88,6 +95,7 @@ fn print_banner(config: &Config) {
     println!("║  静默阈值: {:3} 秒 (用户设置)                             ║", config.silence_threshold);
     println!("║  额外等待: {:3} 秒 (用户设置)                             ║", config.sleep_time);
     println!("║  总等待:   {:3} 秒                                        ║", total_wait);
+    println!("║  轮次限制: {:46} ║", limit_display);
     println!("║  继续提示词: {:44} ║", truncate_str(&prompt_display, 44));
     if config.is_continue_prompt_io() {
         println!("║  [IO模式] 每次使用时重新读取文件                          ║");
@@ -137,6 +145,9 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
 
     // 自动继续计数器
     let mut auto_continue_count = 0u64;
+
+    // 最大轮次限制（负数表示无限制）
+    let limit = config.limit;
 
     // 创建检测器
     let mut detector = create_detector(&config.cli);
@@ -273,6 +284,12 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
                     }
                 }
             }
+        }
+
+        // 检查是否达到轮次限制
+        if limit >= 0 && auto_continue_count >= limit as u64 {
+            println!("\n[AC] 已达到最大轮次限制 ({} 次)，停止自动发送", limit);
+            break;
         }
 
         // 短暂休眠避免忙等待（每500ms检查一次）
