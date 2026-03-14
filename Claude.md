@@ -7,10 +7,9 @@ AutoContinue (AC) 是一个使用 Rust 开发的 CLI 工具包装器，用于自
 ## 核心功能
 
 1. **自动继续**: CLI 静默超时后自动发送继续提示词
-2. **错误检测**: 通过红色文本检测错误状态
+2. **智能检测**: 通过 Detector 适配器精确检测 CLI 状态和错误
 3. **自动重试**: 检测到错误时自动发送重试提示词
 4. **完整交互性**: 使用 PTY 保持 CLI 的完整功能
-5. **鼠标支持**: 支持鼠标事件转发
 
 ## 使用方法
 
@@ -50,12 +49,16 @@ ac claude -cpio prompt.md
 
 ```
 src/
-├── main.rs      # 程序入口、主循环
-├── args.rs      # 命令行参数解析（clap）
-├── config.rs    # 配置管理、提示词加载
-├── runner.rs    # CLI运行器（PTY、IO转发、鼠标支持）
-├── monitor.rs   # 状态监控、Ctrl+C处理
-└── terminal.rs  # 虚拟终端、ANSI解析、颜色检测
+├── main.rs              # 程序入口、主循环
+├── args.rs              # 命令行参数解析（clap）
+├── config.rs            # 配置管理、提示词加载
+├── runner.rs            # CLI运行器（PTY、IO转发）
+├── monitor.rs           # 状态监控、Ctrl+C处理
+└── detector/            # 状态/错误检测引擎
+    ├── mod.rs           #   Detector trait + CliStatus 枚举
+    ├── claude.rs        #   Claude Code 适配器（JSONL 会话文件监控）
+    ├── codex.rs         #   Codex 适配器（JSONL 会话文件监控）
+    └── generic.rs       #   通用适配器（输出文本模式匹配）
 ```
 
 ## 技术实现
@@ -68,19 +71,25 @@ src/
 
 ### 双向 IO 转发
 
-- **输出线程**: PTY → stdout + 虚拟终端处理
-- **输入线程**: stdin → PTY（支持键盘和鼠标事件）
+- **输出线程**: PTY → stdout（直接转发，不解析）+ Detector 数据投喂
+- **输入线程**: stdin → PTY（支持键盘事件）
 
-### 错误检测
+### Detector 检测引擎
 
-通过虚拟终端追踪屏幕内容：
-- 解析 ANSI 转义序列
-- 统计红色字符数量
-- 超过 50 个红色字符判定为错误
+使用 trait 对象实现适配器模式，根据 CLI 名称自动选择：
 
-### 鼠标支持
+| CLI 工具 | 适配器 | 检测机制 |
+|----------|--------|---------|
+| Claude Code | ClaudeDetector | 监控 `~/.claude/projects/` JSONL 会话文件 |
+| Codex | CodexDetector | 监控 `~/.codex/sessions/` JSONL 会话文件 |
+| 其他 | GenericDetector | 输出文本模式匹配 + 静默超时 |
 
-使用 SGR 扩展鼠标编码格式转发鼠标事件。
+#### CliStatus 状态枚举
+
+- `Busy`: CLI 正在工作，不干预
+- `Idle`: CLI 空闲等待输入，发送继续 prompt
+- `Error`: 检测到错误，发送重试 prompt
+- `Unknown`: 状态不明，fallback 到静默超时检测
 
 ## 开发准则
 

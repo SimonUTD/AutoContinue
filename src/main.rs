@@ -5,7 +5,10 @@
 //! ## 功能特性
 //! - 自动检测CLI静默状态（无输入/输出）
 //! - 静默超过阈值时自动发送继续提示词
-//! - 检测错误输出（红色文本）自动发送重试提示词
+//! - 通过 Detector 适配器精确检测 CLI 状态和错误
+//!   - Claude Code: 监控 JSONL 会话文件
+//!   - Codex: 监控 JSONL 会话文件
+//!   - 其他工具: 输出文本模式匹配
 //! - 保持CLI的完整交互性，用户可正常操作
 //! - 任何输入/输出都会重置静默计时器
 //! - Ctrl+C优雅退出
@@ -17,17 +20,18 @@
 
 mod args;
 mod config;
+mod detector;
 mod monitor;
 mod runner;
-mod terminal;
 
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use config::Config;
+use detector::{CliStatus, create_detector};
 use monitor::{create_exit_flag, setup_ctrlc_handler};
 use runner::Runner;
 
@@ -73,10 +77,14 @@ fn print_banner(config: &Config) {
         config.continue_prompt.clone()
     };
 
+    // 创建检测器以显示类型
+    let detector = create_detector(&config.cli);
+
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║           AutoContinue (AC) v{}                        ║", VERSION);
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  CLI: {:50} ║", config.cli);
+    println!("║  检测器: {:47} ║", detector.name());
     println!("║  静默阈值: {:3} 秒 (用户设置)                             ║", config.silence_threshold);
     println!("║  额外等待: {:3} 秒 (用户设置)                             ║", config.sleep_time);
     println!("║  总等待:   {:3} 秒                                        ║", total_wait);
@@ -110,11 +118,12 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 /// 主运行循环
 ///
 /// 该函数实现核心的无限循环逻辑：
-/// 1. 启动CLI进程
-/// 2. 持续监控静默时间
-/// 3. 静默超过阈值时自动发送继续提示词
-/// 4. 任何输入/输出都会重置计时器
-/// 5. 循环直到用户按Ctrl+C或CLI进程退出
+/// 1. 创建 Detector 适配器并初始化
+/// 2. 启动CLI进程
+/// 3. 持续查询 Detector 获取 CLI 状态
+/// 4. 根据状态决定是否发送继续/重试提示词
+/// 5. 对于 Unknown 状态，fallback 到静默超时检测
+/// 6. 循环直到用户按Ctrl+C或CLI进程退出
 ///
 /// # 参数
 /// - `config`: 程序配置
@@ -129,15 +138,23 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
     // 自动继续计数器
     let mut auto_continue_count = 0u64;
 
-    println!("[AC] 正在启动: {} {}", config.cli, config.cli_args.join(" "));
+    // 创建检测器
+    let mut detector = create_detector(&config.cli);
+    detector.init(&config.cli, &config.cli_args)
+        .context("检测器初始化失败")?;
+    let detector_name = detector.name().to_string();
+    let shared_detector = Arc::new(Mutex::new(detector));
 
-    // 启动CLI进程
-    let mut runner = Runner::new(&config.cli, &config.cli_args)?;
+    println!("[AC] 正在启动: {} {}", config.cli, config.cli_args.join(" "));
+    println!("[AC] 使用检测器: {}", detector_name);
+
+    // 启动CLI进程（传入共享检测器）
+    let mut runner = Runner::new(&config.cli, &config.cli_args, shared_detector.clone())?;
 
     // 启动双向IO转发（stdout和stdin）
     let _io_handles = runner.start_io_forwarding()?;
 
-    println!("[AC] CLI已启动，开始监控静默状态...");
+    println!("[AC] CLI已启动，开始监控状态...");
     println!("[AC] 静默超过 {} 秒将自动发送继续提示词", silence_threshold.as_secs());
 
     // 主监控循环
@@ -157,63 +174,105 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
         // 获取当前静默时间
         let silence_duration = runner.get_silence_duration();
 
-        // 检查是否超过静默阈值
-        if silence_duration >= silence_threshold {
-            auto_continue_count += 1;
+        // 查询 Detector 获取 CLI 状态
+        let status = if let Ok(det) = shared_detector.lock() {
+            det.status(silence_duration, silence_threshold)
+        } else {
+            CliStatus::Unknown
+        };
 
-            // 检测是否有错误输出
-            let is_error = runner.has_error_output();
+        // 根据状态决定行为
+        match status {
+            CliStatus::Busy => {
+                // CLI 正在工作，不干预
+            }
 
-            // 根据错误状态选择提示词
-            let (prompt, prompt_type) = if is_error {
-                // 检测到错误，使用重试提示词
-                match config.get_retry_prompt() {
-                    Ok(p) => (p, "重试"),
-                    Err(e) => {
-                        eprintln!("[AC] 获取重试提示词失败: {}", e);
-                        continue;
-                    }
-                }
-            } else {
-                // 正常状态，使用继续提示词
-                match config.get_continue_prompt() {
-                    Ok(p) => (p, "继续"),
+            CliStatus::Idle => {
+                // Detector 确认 CLI 空闲，发送继续 prompt
+                auto_continue_count += 1;
+
+                let prompt = match config.get_continue_prompt() {
+                    Ok(p) => p,
                     Err(e) => {
                         eprintln!("[AC] 获取继续提示词失败: {}", e);
+                        thread::sleep(Duration::from_millis(500));
                         continue;
                     }
-                }
-            };
+                };
 
-            // 发送提示词
-            if is_error {
-                let error_content = runner.get_error_content();
-                println!("\n[AC] === 静默 {} 秒，检测到错误输出，自动发送第 {} 次{}提示词 ===",
-                    silence_duration.as_secs(), auto_continue_count, prompt_type);
-                if !error_content.is_empty() {
-                    // 截断过长的错误内容（使用字符而非字节，避免UTF-8截断问题）
-                    let display_content: String = error_content.chars().take(50).collect();
-                    if error_content.chars().count() > 50 {
-                        println!("[AC] 错误内容: {}...", display_content);
-                    } else {
-                        println!("[AC] 错误内容: {}", display_content);
+                println!("\n[AC] === [{}] 检测到空闲状态，自动发送第 {} 次继续提示词 ===",
+                    detector_name, auto_continue_count);
+                println!("[AC] 发送: {}", prompt);
+
+                if let Err(e) = runner.send_line(&prompt) {
+                    eprintln!("[AC] 发送提示词失败: {}", e);
+                }
+
+                // 重置检测器状态
+                if let Ok(mut det) = shared_detector.lock() {
+                    det.reset();
+                }
+            }
+
+            CliStatus::Error { ref message } => {
+                // Detector 检测到错误，发送重试 prompt
+                auto_continue_count += 1;
+
+                let prompt = match config.get_retry_prompt() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[AC] 获取重试提示词失败: {}", e);
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                };
+
+                println!("\n[AC] === [{}] 检测到错误，自动发送第 {} 次重试提示词 ===",
+                    detector_name, auto_continue_count);
+                if !message.is_empty() {
+                    let display_msg: String = message.chars().take(80).collect();
+                    println!("[AC] 错误信息: {}", display_msg);
+                }
+                println!("[AC] 发送: {}", prompt);
+
+                if let Err(e) = runner.send_line(&prompt) {
+                    eprintln!("[AC] 发送提示词失败: {}", e);
+                }
+
+                // 重置检测器状态
+                if let Ok(mut det) = shared_detector.lock() {
+                    det.reset();
+                }
+            }
+
+            CliStatus::Unknown => {
+                // Detector 无法确定状态，fallback 到传统静默超时检测
+                if silence_duration >= silence_threshold {
+                    auto_continue_count += 1;
+
+                    let prompt = match config.get_continue_prompt() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("[AC] 获取继续提示词失败: {}", e);
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
+                    };
+
+                    println!("\n[AC] === 静默 {} 秒，自动发送第 {} 次继续提示词 (fallback) ===",
+                        silence_duration.as_secs(), auto_continue_count);
+                    println!("[AC] 发送: {}", prompt);
+
+                    if let Err(e) = runner.send_line(&prompt) {
+                        eprintln!("[AC] 发送提示词失败: {}", e);
+                    }
+
+                    // 重置检测器状态
+                    if let Ok(mut det) = shared_detector.lock() {
+                        det.reset();
                     }
                 }
-            } else {
-                println!("\n[AC] === 静默 {} 秒，自动发送第 {} 次{}提示词 ===",
-                    silence_duration.as_secs(), auto_continue_count, prompt_type);
             }
-            println!("[AC] 发送: {}", prompt);
-
-            if let Err(e) = runner.send_line(&prompt) {
-                eprintln!("[AC] 发送提示词失败: {}", e);
-            }
-
-            // 清除错误检测状态，准备下一轮检测
-            runner.clear_error_state();
-
-            // 发送后活动时间会自动更新（在send_input中）
-            // 不需要手动重置
         }
 
         // 短暂休眠避免忙等待（每500ms检查一次）

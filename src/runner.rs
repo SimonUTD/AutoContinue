@@ -6,12 +6,17 @@
 //! - 使用portable-pty启动CLI进程
 //! - 双向IO转发：stdin -> PTY，PTY -> stdout
 //! - 跟踪最后活动时间（输入/输出）用于静默检测
-//! - 虚拟终端追踪输出内容，用于错误检测
+//! - 输出数据同时发送给 Detector 进行状态/错误分析
 //! - 确保用户可以正常操作CLI
 //!
 //! ## 跨平台支持
 //! - Windows: 使用ConPTY
 //! - Unix/Linux/macOS: 使用传统PTY
+//!
+//! ## 与旧版本的区别
+//! - 移除了虚拟终端（VirtualTerminal）ANSI 解析
+//! - 输出直接转发到 stdout，不做任何解析/修改
+//! - 状态/错误检测委托给 Detector 模块
 
 use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -24,14 +29,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::terminal::{SharedTerminal, create_shared_terminal};
+use crate::detector::Detector;
+
+/// 共享检测器类型别名
+///
+/// Detector trait 对象被 Arc<Mutex<>> 包装以支持多线程访问：
+/// - 输出线程：调用 feed_output() 投喂数据
+/// - 主线程：调用 status() 查询状态、reset() 重置
+pub type SharedDetector = Arc<Mutex<Box<dyn Detector>>>;
 
 /// IO转发线程句柄
 ///
 /// 包含输出和输入转发线程的句柄
 #[allow(dead_code)]
 pub struct IoHandles {
-    /// 输出转发线程句柄（PTY -> stdout）
+    /// 输出转发线程句柄（PTY -> stdout + Detector）
     pub output_handle: thread::JoinHandle<()>,
     /// 输入转发线程句柄（stdin -> PTY）
     pub input_handle: thread::JoinHandle<()>,
@@ -42,7 +54,7 @@ pub struct IoHandles {
 /// 负责启动CLI进程并管理其生命周期。
 /// 使用PTY来保持CLI的完整交互性。
 /// 跟踪最后活动时间用于静默检测。
-/// 使用虚拟终端追踪输出内容用于错误检测。
+/// 输出数据同时发送给 Detector 进行分析。
 pub struct Runner {
     /// PTY pair（主端和从端）
     pty_pair: PtyPair,
@@ -67,8 +79,8 @@ pub struct Runner {
     /// 通过这个 channel 发送的数据会被输入线程当作用户输入处理
     inject_sender: Option<Sender<Vec<u8>>>,
 
-    /// 虚拟终端，用于追踪输出内容和检测错误
-    terminal: SharedTerminal,
+    /// 共享检测器，用于接收输出数据并进行状态分析
+    detector: SharedDetector,
 }
 
 impl Runner {
@@ -77,6 +89,7 @@ impl Runner {
     /// # 参数
     /// - `cli`: CLI程序名称
     /// - `args`: CLI程序参数
+    /// - `detector`: 检测器实例（已初始化）
     ///
     /// # 返回值
     /// 成功返回Runner实例，失败返回错误
@@ -84,14 +97,12 @@ impl Runner {
     /// # 错误
     /// - 无法创建PTY
     /// - 无法启动CLI进程
-    pub fn new(cli: &str, args: &[String]) -> Result<Self> {
+    pub fn new(cli: &str, args: &[String], detector: SharedDetector) -> Result<Self> {
         // 获取原生PTY系统
         let pty_system = native_pty_system();
 
         // 获取终端大小，如果失败则使用默认值
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let terminal_width = cols as usize;
-        let terminal_height = rows as usize;
 
         // 创建PTY对，指定终端大小
         let pair = pty_system
@@ -107,8 +118,7 @@ impl Runner {
         let current_dir = std::env::current_dir().context("无法获取当前工作目录")?;
 
         // 构建命令
-        // 在Windows上，直接使用命令名，让系统PATH来解析
-        // 对于.cmd/.bat脚本（如npm全局安装的CLI），需要通过cmd.exe来执行
+        // 在Windows上，通过cmd.exe执行以支持.cmd/.bat脚本
         #[cfg(target_os = "windows")]
         let cmd = {
             let mut c = CommandBuilder::new("cmd.exe");
@@ -143,9 +153,6 @@ impl Runner {
         let exit_status = Arc::new(Mutex::new(None));
         let last_activity_time = Arc::new(Mutex::new(Instant::now()));
 
-        // 创建虚拟终端用于追踪输出和检测错误
-        let terminal = create_shared_terminal(terminal_width, terminal_height);
-
         Ok(Runner {
             pty_pair: pair,
             writer: Arc::new(Mutex::new(writer)),
@@ -154,18 +161,18 @@ impl Runner {
             exit_status,
             last_activity_time,
             inject_sender: None,
-            terminal,
+            detector,
         })
     }
 
     /// 启动双向IO转发线程
     ///
     /// 该方法启动两个后台线程：
-    /// 1. 输出转发：PTY -> stdout（显示CLI输出）+ 虚拟终端处理
+    /// 1. 输出转发：PTY -> stdout（直接转发，不解析）+ Detector 数据投喂
     /// 2. 输入转发：stdin -> PTY（用户输入到CLI）
     ///
     /// 每次有输入或输出时，都会更新最后活动时间。
-    /// 输出数据同时被送入虚拟终端进行解析和错误检测。
+    /// 输出数据同时被发送给 Detector 进行状态分析。
     ///
     /// # 返回值
     /// 返回包含两个线程句柄的IoHandles结构
@@ -195,11 +202,12 @@ impl Runner {
         let (inject_tx, inject_rx) = mpsc::channel::<Vec<u8>>();
         self.inject_sender = Some(inject_tx);
 
-        // 获取虚拟终端的共享引用
-        let terminal = self.terminal.clone();
+        // 获取检测器的共享引用
+        let detector = self.detector.clone();
 
-        // 启动输出转发线程：PTY -> stdout + 虚拟终端
-        // 每次有输出时更新最后活动时间，并送入虚拟终端处理
+        // 启动输出转发线程：PTY -> stdout + Detector
+        // 输出数据直接转发到 stdout（不经过 ANSI 解析），
+        // 同时发送给 Detector 进行分析
         let output_handle = thread::spawn(move || {
             let mut stdout = std::io::stdout();
             let mut buffer = [0u8; 4096];
@@ -211,18 +219,20 @@ impl Runner {
                         break;
                     }
                     Ok(n) => {
+                        let data = &buffer[..n];
+
                         // 更新最后活动时间（有输出）
                         if let Ok(mut time) = last_activity_output.lock() {
                             *time = Instant::now();
                         }
 
-                        // 将数据送入虚拟终端处理（用于错误检测）
-                        if let Ok(mut term) = terminal.lock() {
-                            term.process(&buffer[..n]);
+                        // 将数据发送给 Detector 进行分析
+                        if let Ok(mut det) = detector.lock() {
+                            det.feed_output(data);
                         }
 
-                        // 将数据写入stdout
-                        if stdout.write_all(&buffer[..n]).is_err() {
+                        // 将数据直接写入 stdout（不做任何解析/修改）
+                        if stdout.write_all(data).is_err() {
                             break;
                         }
                         let _ = stdout.flush();
@@ -399,45 +409,6 @@ impl Runner {
         }
     }
 
-    /// 检查输出中是否包含红色文本（错误检测）
-    ///
-    /// 通过虚拟终端分析自上次检查以来的新增输出，
-    /// 判断是否包含红色文本，用于区分正常结束和错误状态。
-    ///
-    /// # 返回值
-    /// 如果检测到红色文本返回 true，表示可能是错误
-    pub fn has_error_output(&self) -> bool {
-        if let Ok(term) = self.terminal.lock() {
-            term.has_red_content()
-        } else {
-            false
-        }
-    }
-
-    /// 获取错误输出内容
-    ///
-    /// 返回虚拟终端中检测到的红色文本内容
-    ///
-    /// # 返回值
-    /// 红色文本内容字符串
-    pub fn get_error_content(&self) -> String {
-        if let Ok(term) = self.terminal.lock() {
-            term.get_red_content()
-        } else {
-            String::new()
-        }
-    }
-
-    /// 清除错误检测状态
-    ///
-    /// 在发送提示词后调用，重置新增内容追踪器，
-    /// 准备检测下一轮输出中的错误。
-    pub fn clear_error_state(&self) {
-        if let Ok(mut term) = self.terminal.lock() {
-            term.clear_new_content();
-        }
-    }
-
     /// 停止运行标志并恢复终端模式
     ///
     /// 设置运行标志为false，通知所有相关线程停止
@@ -569,12 +540,14 @@ fn key_event_to_bytes(key_event: &KeyEvent) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::detector;
 
     /// 测试简单命令执行
     #[test]
     #[cfg(target_os = "windows")]
     fn test_simple_command() -> Result<()> {
-        let mut runner = Runner::new("cmd", &["/c".to_string(), "echo".to_string(), "hello".to_string()])?;
+        let det = Arc::new(Mutex::new(detector::create_detector("test")));
+        let mut runner = Runner::new("cmd", &["/c".to_string(), "echo".to_string(), "hello".to_string()], det)?;
 
         // 等待进程结束
         let status = runner.child.wait().context("等待进程失败")?;
@@ -586,7 +559,8 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn test_simple_command() -> Result<()> {
-        let mut runner = Runner::new("echo", &["hello".to_string()])?;
+        let det = Arc::new(Mutex::new(detector::create_detector("test")));
+        let mut runner = Runner::new("echo", &["hello".to_string()], det)?;
 
         // 等待进程结束
         let status = runner.child.wait().context("等待进程失败")?;
@@ -598,7 +572,8 @@ mod tests {
     /// 测试静默时间检测
     #[test]
     fn test_silence_duration() -> Result<()> {
-        let runner = Runner::new("cmd", &["/c".to_string(), "echo".to_string(), "test".to_string()])?;
+        let det = Arc::new(Mutex::new(detector::create_detector("test")));
+        let runner = Runner::new("cmd", &["/c".to_string(), "echo".to_string(), "test".to_string()], det)?;
 
         // 刚创建时静默时间应该很短
         let duration = runner.get_silence_duration();
