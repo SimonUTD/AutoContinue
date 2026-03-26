@@ -11,8 +11,8 @@
 //!                   |-> UserResumed -> Running
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// 进程状态枚举

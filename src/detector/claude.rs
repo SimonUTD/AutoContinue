@@ -462,7 +462,7 @@ mod tests {
             message: Some(MessageContent {
                 role: Some("assistant".to_string()),
                 content: serde_json::Value::String(
-                    "I encountered an error while running the build".to_string()
+                    "I encountered an error while running the build".to_string(),
                 ),
             }),
         };
@@ -479,7 +479,7 @@ mod tests {
             message: Some(MessageContent {
                 role: Some("assistant".to_string()),
                 content: serde_json::Value::String(
-                    "I've successfully completed the task".to_string()
+                    "I've successfully completed the task".to_string(),
                 ),
             }),
         };

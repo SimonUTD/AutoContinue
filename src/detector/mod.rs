@@ -8,6 +8,7 @@
 //! - `Detector` trait：定义统一的检测接口
 //! - `ClaudeDetector`：Claude Code 适配器，监控 JSONL 会话文件
 //! - `CodexDetector`：Codex 适配器，监控 JSONL 会话文件
+//! - `OpenCodeDetector`：OpenCode 适配器，监控结构化消息文件
 //! - `GenericDetector`：通用适配器，基于输出文本模式匹配
 //!
 //! ## 使用流程
@@ -21,6 +22,7 @@
 pub mod claude;
 pub mod codex;
 pub mod generic;
+pub mod opencode;
 
 use anyhow::Result;
 use std::fmt;
@@ -144,6 +146,7 @@ pub trait Detector: Send {
 /// # 匹配规则
 /// - 名称包含 "claude" → `ClaudeDetector`
 /// - 名称包含 "codex" → `CodexDetector`
+/// - 名称包含 "opencode" → `OpenCodeDetector`
 /// - 其他 → `GenericDetector`
 pub fn create_detector(cli_name: &str) -> Box<dyn Detector> {
     let name_lower = cli_name.to_lowercase();
@@ -152,6 +155,8 @@ pub fn create_detector(cli_name: &str) -> Box<dyn Detector> {
         Box::new(claude::ClaudeDetector::new())
     } else if name_lower.contains("codex") {
         Box::new(codex::CodexDetector::new())
+    } else if name_lower.contains("opencode") {
+        Box::new(opencode::OpenCodeDetector::new())
     } else {
         Box::new(generic::GenericDetector::new())
     }
@@ -167,7 +172,12 @@ mod tests {
         assert_eq!(format!("{}", CliStatus::Busy), "忙碌中");
         assert_eq!(format!("{}", CliStatus::Idle), "空闲");
         assert_eq!(
-            format!("{}", CliStatus::Error { message: "连接超时".to_string() }),
+            format!(
+                "{}",
+                CliStatus::Error {
+                    message: "连接超时".to_string()
+                }
+            ),
             "错误: 连接超时"
         );
         assert_eq!(format!("{}", CliStatus::Unknown), "未知");
@@ -197,6 +207,6 @@ mod tests {
         assert_eq!(d.name(), "GenericDetector");
 
         let d = create_detector("opencode");
-        assert_eq!(d.name(), "GenericDetector");
+        assert_eq!(d.name(), "OpenCodeDetector");
     }
 }

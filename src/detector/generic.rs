@@ -36,7 +36,7 @@ const OUTPUT_BUFFER_MAX: usize = 8192;
 /// 这些关键词覆盖了大多数 CLI 工具的错误输出格式。
 const ERROR_PATTERNS: &[&str] = &[
     "error:",
-    "error[",      // Rust 编译器错误格式 error[E0xxx]
+    "error[", // Rust 编译器错误格式 error[E0xxx]
     "fatal:",
     "fatal error",
     "panic:",
@@ -44,11 +44,11 @@ const ERROR_PATTERNS: &[&str] = &[
     "failed:",
     "failure:",
     "exception:",
-    "traceback",   // Python 错误
+    "traceback", // Python 错误
     "segfault",
     "segmentation fault",
     "abort",
-    "denied",      // permission denied 等
+    "denied", // permission denied 等
 ];
 
 /// 通用检测适配器
@@ -153,7 +153,7 @@ impl Detector for GenericDetector {
             // 找到一个安全的 UTF-8 边界进行截断
             let trim_to = self.output_buffer.len() - OUTPUT_BUFFER_MAX / 2;
             // 确保在字符边界处截断
-            let safe_trim = self.output_buffer.ceil_char_boundary(trim_to);
+            let safe_trim = next_char_boundary(&self.output_buffer, trim_to);
             self.output_buffer = self.output_buffer[safe_trim..].to_string();
         }
 
@@ -205,6 +205,20 @@ impl Detector for GenericDetector {
     fn name(&self) -> &str {
         "GenericDetector"
     }
+}
+
+/// 返回不小于 `from` 的最近 UTF-8 字符边界
+fn next_char_boundary(text: &str, from: usize) -> usize {
+    if from >= text.len() {
+        return text.len();
+    }
+
+    let mut index = from;
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+
+    index
 }
 
 #[cfg(test)]

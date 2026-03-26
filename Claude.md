@@ -59,6 +59,7 @@ src/
     ├── mod.rs           #   Detector trait + CliStatus 枚举
     ├── claude.rs        #   Claude Code 适配器（JSONL 会话文件监控）
     ├── codex.rs         #   Codex 适配器（JSONL 会话文件监控）
+    ├── opencode.rs      #   OpenCode 适配器（结构化消息文件监控）
     └── generic.rs       #   通用适配器（输出文本模式匹配）
 ```
 
@@ -83,6 +84,7 @@ src/
 |----------|--------|---------|
 | Claude Code | ClaudeDetector | 监控 `~/.claude/projects/` JSONL 会话文件 |
 | Codex | CodexDetector | 监控 `~/.codex/sessions/` JSONL 会话文件 |
+| OpenCode | OpenCodeDetector | 监控 `~/.local/share/opencode/storage/message/` 消息文件 |
 | 其他 | GenericDetector | 输出文本模式匹配 + 静默超时 |
 
 #### CliStatus 状态枚举

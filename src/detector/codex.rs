@@ -238,9 +238,10 @@ impl CodexDetector {
 
             // 提取角色信息
             // Codex 的消息可能直接有 role 字段，也可能嵌套在 message 中
-            let role = msg.role.clone().or_else(|| {
-                msg.message.as_ref().and_then(|m| m.role.clone())
-            });
+            let role = msg
+                .role
+                .clone()
+                .or_else(|| msg.message.as_ref().and_then(|m| m.role.clone()));
 
             if let Some(ref r) = role {
                 self.last_message_role = Some(r.clone());

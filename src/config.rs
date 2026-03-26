@@ -103,24 +103,25 @@ impl Config {
         // 1. IO模式：存储文件路径，每次使用时重新读取
         // 2. 文件模式：启动时读取一次，存储内容
         // 3. 参数/默认值模式：直接使用字符串
-        let (continue_prompt, continue_prompt_io) = if let Some(ref io_path) = args.continue_prompt_io {
-            // IO模式：验证文件存在，存储路径
-            if !Path::new(io_path).exists() {
-                anyhow::bail!("继续提示词IO文件不存在: {}", io_path);
-            }
-            (String::new(), Some(io_path.clone()))
-        } else if let Some(ref prompt) = args.continue_prompt {
-            // 从命令行参数读取继续提示词
-            (prompt.clone(), None)
-        } else if let Some(ref file_path) = args.continue_prompt_file {
-            // 从文件读取继续提示词（一次性）
-            let prompt = load_prompt_from_file(file_path)
-                .with_context(|| format!("无法从文件加载继续提示词: {}", file_path))?;
-            (prompt, None)
-        } else {
-            // 使用默认继续提示词
-            (DEFAULT_CONTINUE_PROMPT.to_string(), None)
-        };
+        let (continue_prompt, continue_prompt_io) =
+            if let Some(ref io_path) = args.continue_prompt_io {
+                // IO模式：验证文件存在，存储路径
+                if !Path::new(io_path).exists() {
+                    anyhow::bail!("继续提示词IO文件不存在: {}", io_path);
+                }
+                (String::new(), Some(io_path.clone()))
+            } else if let Some(ref prompt) = args.continue_prompt {
+                // 从命令行参数读取继续提示词
+                (prompt.clone(), None)
+            } else if let Some(ref file_path) = args.continue_prompt_file {
+                // 从文件读取继续提示词（一次性）
+                let prompt = load_prompt_from_file(file_path)
+                    .with_context(|| format!("无法从文件加载继续提示词: {}", file_path))?;
+                (prompt, None)
+            } else {
+                // 使用默认继续提示词
+                (DEFAULT_CONTINUE_PROMPT.to_string(), None)
+            };
 
         // 处理重试提示词：同样支持三种模式
         let (retry_prompt, retry_prompt_io) = if let Some(ref io_path) = args.retry_prompt_io {
@@ -251,14 +252,13 @@ impl Config {
 /// - 单独的 `\r` 也会被转换为 `\n`
 /// 这确保了跨平台的一致行为
 fn load_prompt_from_file<P: AsRef<Path>>(path: P) -> Result<String> {
-    let content = fs::read_to_string(path.as_ref())
-        .with_context(|| "读取文件失败")?;
+    let content = fs::read_to_string(path.as_ref()).with_context(|| "读取文件失败")?;
 
     // 标准化换行符：将 \r\n 和单独的 \r 都转换为 \n
     // 这样可以避免在PTY中换行被重复处理
     let normalized = content
-        .replace("\r\n", "\n")  // Windows换行符 -> Unix换行符
-        .replace("\r", "\n");   // 旧Mac换行符 -> Unix换行符
+        .replace("\r\n", "\n") // Windows换行符 -> Unix换行符
+        .replace("\r", "\n"); // 旧Mac换行符 -> Unix换行符
 
     // 去除首尾空白字符
     Ok(normalized.trim().to_string())

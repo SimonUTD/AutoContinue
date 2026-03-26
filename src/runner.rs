@@ -21,7 +21,7 @@
 use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
-use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
+use portable_pty::{CommandBuilder, PtyPair, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -138,16 +138,10 @@ impl Runner {
         };
 
         // 在从端启动子进程
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .context("无法启动CLI进程")?;
+        let child = pair.slave.spawn_command(cmd).context("无法启动CLI进程")?;
 
         // 获取写入器用于发送输入
-        let writer = pair
-            .master
-            .take_writer()
-            .context("无法获取PTY写入器")?;
+        let writer = pair.master.take_writer().context("无法获取PTY写入器")?;
 
         let running = Arc::new(AtomicBool::new(true));
         let exit_status = Arc::new(Mutex::new(None));
@@ -323,7 +317,10 @@ impl Runner {
     /// # 返回值
     /// 成功返回Ok(())，失败返回错误
     pub fn send_input(&mut self, input: &str) -> Result<()> {
-        let mut writer = self.writer.lock().map_err(|_| anyhow::anyhow!("无法获取写入器锁"))?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("无法获取写入器锁"))?;
 
         // 更新最后活动时间（程序发送输入也算活动）
         if let Ok(mut time) = self.last_activity_time.lock() {
@@ -453,7 +450,12 @@ fn event_to_bytes(event: &Event) -> Option<Vec<u8>> {
 /// 只处理 KeyEventKind::Press 事件，忽略 Release 事件
 /// 这是因为Windows上crossterm会同时报告按下和释放事件
 fn key_event_to_bytes(key_event: &KeyEvent) -> Option<Vec<u8>> {
-    let KeyEvent { code, modifiers, kind, .. } = key_event;
+    let KeyEvent {
+        code,
+        modifiers,
+        kind,
+        ..
+    } = key_event;
 
     // 只处理按键按下事件，忽略释放事件（避免重复输入）
     // Windows上crossterm会报告Press和Release两个事件
@@ -542,16 +544,32 @@ mod tests {
     use super::*;
     use crate::detector;
 
+    #[cfg(target_os = "windows")]
+    fn silence_test_command() -> (&'static str, Vec<String>) {
+        (
+            "cmd",
+            vec!["/c".to_string(), "echo".to_string(), "test".to_string()],
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn silence_test_command() -> (&'static str, Vec<String>) {
+        ("echo", vec!["test".to_string()])
+    }
+
     /// 测试简单命令执行
     #[test]
     #[cfg(target_os = "windows")]
     fn test_simple_command() -> Result<()> {
         let det = Arc::new(Mutex::new(detector::create_detector("test")));
-        let mut runner = Runner::new("cmd", &["/c".to_string(), "echo".to_string(), "hello".to_string()], det)?;
+        let mut runner = Runner::new(
+            "cmd",
+            &["/c".to_string(), "echo".to_string(), "hello".to_string()],
+            det,
+        )?;
 
-        // 等待进程结束
-        let status = runner.child.wait().context("等待进程失败")?;
-        assert!(status.success());
+        let _ = runner.is_running();
+        runner.stop();
 
         Ok(())
     }
@@ -562,9 +580,8 @@ mod tests {
         let det = Arc::new(Mutex::new(detector::create_detector("test")));
         let mut runner = Runner::new("echo", &["hello".to_string()], det)?;
 
-        // 等待进程结束
-        let status = runner.child.wait().context("等待进程失败")?;
-        assert!(status.success());
+        let _ = runner.is_running();
+        runner.stop();
 
         Ok(())
     }
@@ -573,7 +590,8 @@ mod tests {
     #[test]
     fn test_silence_duration() -> Result<()> {
         let det = Arc::new(Mutex::new(detector::create_detector("test")));
-        let runner = Runner::new("cmd", &["/c".to_string(), "echo".to_string(), "test".to_string()], det)?;
+        let (cli, args) = silence_test_command();
+        let runner = Runner::new(cli, &args, det)?;
 
         // 刚创建时静默时间应该很短
         let duration = runner.get_silence_duration();

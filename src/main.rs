@@ -8,6 +8,7 @@
 //! - 通过 Detector 适配器精确检测 CLI 状态和错误
 //!   - Claude Code: 监控 JSONL 会话文件
 //!   - Codex: 监控 JSONL 会话文件
+//!   - OpenCode: 监控结构化消息文件
 //!   - 其他工具: 输出文本模式匹配
 //! - 保持CLI的完整交互性，用户可正常操作
 //! - 任何输入/输出都会重置静默计时器
@@ -88,13 +89,25 @@ fn print_banner(config: &Config) {
     };
 
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║           AutoContinue (AC) v{}                        ║", VERSION);
+    println!(
+        "║           AutoContinue (AC) v{}                        ║",
+        VERSION
+    );
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  CLI: {:50} ║", config.cli);
     println!("║  检测器: {:47} ║", detector.name());
-    println!("║  静默阈值: {:3} 秒 (用户设置)                             ║", config.silence_threshold);
-    println!("║  额外等待: {:3} 秒 (用户设置)                             ║", config.sleep_time);
-    println!("║  总等待:   {:3} 秒                                        ║", total_wait);
+    println!(
+        "║  静默阈值: {:3} 秒 (用户设置)                             ║",
+        config.silence_threshold
+    );
+    println!(
+        "║  额外等待: {:3} 秒 (用户设置)                             ║",
+        config.sleep_time
+    );
+    println!(
+        "║  总等待:   {:3} 秒                                        ║",
+        total_wait
+    );
     println!("║  轮次限制: {:46} ║", limit_display);
     println!("║  继续提示词: {:44} ║", truncate_str(&prompt_display, 44));
     if config.is_continue_prompt_io() {
@@ -151,12 +164,17 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
 
     // 创建检测器
     let mut detector = create_detector(&config.cli);
-    detector.init(&config.cli, &config.cli_args)
+    detector
+        .init(&config.cli, &config.cli_args)
         .context("检测器初始化失败")?;
     let detector_name = detector.name().to_string();
     let shared_detector = Arc::new(Mutex::new(detector));
 
-    println!("[AC] 正在启动: {} {}", config.cli, config.cli_args.join(" "));
+    println!(
+        "[AC] 正在启动: {} {}",
+        config.cli,
+        config.cli_args.join(" ")
+    );
     println!("[AC] 使用检测器: {}", detector_name);
 
     // 启动CLI进程（传入共享检测器）
@@ -166,7 +184,10 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
     let _io_handles = runner.start_io_forwarding()?;
 
     println!("[AC] CLI已启动，开始监控状态...");
-    println!("[AC] 静默超过 {} 秒将自动发送继续提示词", silence_threshold.as_secs());
+    println!(
+        "[AC] 静默超过 {} 秒将自动发送继续提示词",
+        silence_threshold.as_secs()
+    );
 
     // 主监控循环
     loop {
@@ -211,8 +232,10 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
                     }
                 };
 
-                println!("\n[AC] === [{}] 检测到空闲状态，自动发送第 {} 次继续提示词 ===",
-                    detector_name, auto_continue_count);
+                println!(
+                    "\n[AC] === [{}] 检测到空闲状态，自动发送第 {} 次继续提示词 ===",
+                    detector_name, auto_continue_count
+                );
                 println!("[AC] 发送: {}", prompt);
 
                 if let Err(e) = runner.send_line(&prompt) {
@@ -238,8 +261,10 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
                     }
                 };
 
-                println!("\n[AC] === [{}] 检测到错误，自动发送第 {} 次重试提示词 ===",
-                    detector_name, auto_continue_count);
+                println!(
+                    "\n[AC] === [{}] 检测到错误，自动发送第 {} 次重试提示词 ===",
+                    detector_name, auto_continue_count
+                );
                 if !message.is_empty() {
                     let display_msg: String = message.chars().take(80).collect();
                     println!("[AC] 错误信息: {}", display_msg);
@@ -270,8 +295,11 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
                         }
                     };
 
-                    println!("\n[AC] === 静默 {} 秒，自动发送第 {} 次继续提示词 (fallback) ===",
-                        silence_duration.as_secs(), auto_continue_count);
+                    println!(
+                        "\n[AC] === 静默 {} 秒，自动发送第 {} 次继续提示词 (fallback) ===",
+                        silence_duration.as_secs(),
+                        auto_continue_count
+                    );
                     println!("[AC] 发送: {}", prompt);
 
                     if let Err(e) = runner.send_line(&prompt) {

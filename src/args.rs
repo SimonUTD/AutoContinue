@@ -30,34 +30,51 @@ use std::ffi::OsString;
 /// 包含所有可能的格式：单横线短格式、双横线短格式、双横线长格式
 const AC_ARGS_WITH_VALUE: &[&str] = &[
     // continue-prompt
-    "-cp", "--cp", "--continue-prompt",
+    "-cp",
+    "--cp",
+    "--continue-prompt",
     // continue-prompt-file
-    "-cpf", "--cpf", "--continue-prompt-file",
+    "-cpf",
+    "--cpf",
+    "--continue-prompt-file",
     // continue-prompt-io (新增)
-    "-cpio", "--cpio", "--continue-prompt-io",
+    "-cpio",
+    "--cpio",
+    "--continue-prompt-io",
     // retry-prompt
-    "-rp", "--rp", "--retry-prompt",
+    "-rp",
+    "--rp",
+    "--retry-prompt",
     // retry-prompt-file
-    "-rpf", "--rpf", "--retry-prompt-file",
+    "-rpf",
+    "--rpf",
+    "--retry-prompt-file",
     // retry-prompt-io (新增)
-    "-rpio", "--rpio", "--retry-prompt-io",
+    "-rpio",
+    "--rpio",
+    "--retry-prompt-io",
     // sleep-time
-    "-st", "--st", "--sleep-time",
+    "-st",
+    "--st",
+    "--sleep-time",
     // silence-threshold
-    "-sth", "--sth", "--silence-threshold",
+    "-sth",
+    "--sth",
+    "--silence-threshold",
     // limit (最大轮次)
-    "-l", "--l", "--limit",
+    "-l",
+    "--l",
+    "--limit",
 ];
 
 /// AC参数名称列表（不带值的参数）
-const AC_ARGS_NO_VALUE: &[&str] = &[
-    "-h", "--help",
-    "-v", "--version", "-V",
-];
+const AC_ARGS_NO_VALUE: &[&str] = &["-h", "--help", "-v", "--version", "-V"];
 
 /// AC特有的短参数列表（需要转换为双横线格式）
 /// 这些参数支持单横线格式（如 -cp）但会被转换为双横线格式（如 --cp）
-const AC_SHORT_ARGS: &[&str] = &["-cp", "-cpf", "-cpio", "-rp", "-rpf", "-rpio", "-st", "-sth", "-l"];
+const AC_SHORT_ARGS: &[&str] = &[
+    "-cp", "-cpf", "-cpio", "-rp", "-rpf", "-rpio", "-st", "-sth", "-l",
+];
 
 /// AutoContinue (AC) - 自动继续/重试CLI工具的包装器
 ///
@@ -78,7 +95,12 @@ pub struct Args {
 
     /// 继续的提示词文件路径，从文件读取继续提示词（启动时读取一次）
     /// 与 -cp, -cpio 互斥
-    #[arg(long = "continue-prompt-file", visible_alias = "cpf", value_name = "FILE", conflicts_with = "continue_prompt")]
+    #[arg(
+        long = "continue-prompt-file",
+        visible_alias = "cpf",
+        value_name = "FILE",
+        conflicts_with = "continue_prompt"
+    )]
     pub continue_prompt_file: Option<String>,
 
     /// 继续的提示词IO文件路径，每次使用时重新读取文件
@@ -94,7 +116,12 @@ pub struct Args {
 
     /// 重试的提示词文件路径，从文件读取重试提示词（启动时读取一次）
     /// 与 -rp, -rpio 互斥
-    #[arg(long = "retry-prompt-file", visible_alias = "rpf", value_name = "FILE", conflicts_with = "retry_prompt")]
+    #[arg(
+        long = "retry-prompt-file",
+        visible_alias = "rpf",
+        value_name = "FILE",
+        conflicts_with = "retry_prompt"
+    )]
     pub retry_prompt_file: Option<String>,
 
     /// 重试的提示词IO文件路径，每次使用时重新读取文件
@@ -105,18 +132,34 @@ pub struct Args {
 
     /// 等待时间（秒），用于给用户自主回复的时间
     /// 超过该时间则自动继续，默认15秒
-    #[arg(long = "sleep-time", visible_alias = "st", value_name = "SECONDS", default_value = "15")]
+    #[arg(
+        long = "sleep-time",
+        visible_alias = "st",
+        value_name = "SECONDS",
+        default_value = "15"
+    )]
     pub sleep_time: u64,
 
     /// 静默阈值（秒），CLI无输入/输出超过此时间后开始计算等待时间
     /// 默认30秒，总等待时间 = 静默阈值 + 等待时间
-    #[arg(long = "silence-threshold", visible_alias = "sth", value_name = "SECONDS", default_value = "30")]
+    #[arg(
+        long = "silence-threshold",
+        visible_alias = "sth",
+        value_name = "SECONDS",
+        default_value = "30"
+    )]
     pub silence_threshold: u64,
 
     /// 最大自动发送轮次限制
     /// 达到限制后程序将停止自动发送并退出
     /// 默认 -1 表示无限制
-    #[arg(long = "limit", visible_alias = "l", value_name = "COUNT", default_value = "-1", allow_hyphen_values = true)]
+    #[arg(
+        long = "limit",
+        visible_alias = "l",
+        value_name = "COUNT",
+        default_value = "-1",
+        allow_hyphen_values = true
+    )]
     pub limit: i64,
 
     /// 传递给CLI程序的其他参数
@@ -199,10 +242,10 @@ fn convert_short_arg(arg: &str) -> String {
 /// 返回重新排序后的参数列表，格式适合clap解析
 fn separate_and_reorder_args(args: Vec<String>) -> Vec<String> {
     // 结果容器
-    let mut program_name: Option<String> = None;  // ac程序名
-    let mut cli_name: Option<String> = None;      // CLI程序名（如claude）
-    let mut ac_args: Vec<String> = Vec::new();    // AC参数及其值
-    let mut cli_args: Vec<String> = Vec::new();   // CLI参数
+    let mut program_name: Option<String> = None; // ac程序名
+    let mut cli_name: Option<String> = None; // CLI程序名（如claude）
+    let mut ac_args: Vec<String> = Vec::new(); // AC参数及其值
+    let mut cli_args: Vec<String> = Vec::new(); // CLI参数
 
     let mut iter = args.into_iter().peekable();
 
@@ -316,7 +359,7 @@ mod tests {
     #[test]
     fn test_mixed_args_order() {
         let args = parse_args_from([
-            "ac", "claude", "--resume", "-cp", "继续", "-p", "foo", "-st", "20"
+            "ac", "claude", "--resume", "-cp", "继续", "-p", "foo", "-st", "20",
         ]);
         assert_eq!(args.cli, "claude");
         assert_eq!(args.continue_prompt, Some("继续".to_string()));
@@ -354,7 +397,7 @@ mod tests {
     #[test]
     fn test_multiple_ac_args_mixed() {
         let args = parse_args_from([
-            "ac", "-cp", "继续", "claude", "--resume", "-rp", "重试", "-st", "20"
+            "ac", "-cp", "继续", "claude", "--resume", "-rp", "重试", "-st", "20",
         ]);
         assert_eq!(args.cli, "claude");
         assert_eq!(args.continue_prompt, Some("继续".to_string()));
