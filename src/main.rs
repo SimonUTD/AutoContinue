@@ -70,8 +70,10 @@ fn print_banner(config: &Config) {
     // 计算总等待时间
     let total_wait = config.silence_threshold + config.sleep_time;
 
-    // 获取提示词显示内容（IO模式显示文件路径）
-    let prompt_display = if let Some(ref io_path) = config.continue_prompt_io {
+    // 获取提示词显示内容（根据模式显示不同前缀）
+    let prompt_display = if let Some(ref pipe_cmd) = config.continue_prompt_pipe {
+        format!("[PIPE] {}", pipe_cmd)
+    } else if let Some(ref io_path) = config.continue_prompt_io {
         format!("[IO] {}", io_path)
     } else {
         config.continue_prompt.clone()
@@ -97,7 +99,13 @@ fn print_banner(config: &Config) {
     println!("║  总等待:   {:3} 秒                                        ║", total_wait);
     println!("║  轮次限制: {:46} ║", limit_display);
     println!("║  继续提示词: {:44} ║", truncate_str(&prompt_display, 44));
-    if config.is_continue_prompt_io() {
+    if config.is_continue_prompt_pipe() {
+        println!("║  [PIPE模式] 每次使用时执行命令获取提示词                ║");
+        if let Some((ref prefix, ref suffix)) = config.cformat {
+            println!("║  [CFORMAT] {}...{}                           ║",
+                truncate_str(prefix, 15), truncate_str(suffix, 15));
+        }
+    } else if config.is_continue_prompt_io() {
         println!("║  [IO模式] 每次使用时重新读取文件                          ║");
     }
     println!("╠══════════════════════════════════════════════════════════╣");
