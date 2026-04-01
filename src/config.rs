@@ -308,7 +308,6 @@ impl Config {
     }
 
     /// 检查是否使用重试提示词Pipe模式
-    #[allow(dead_code)]
     pub fn is_retry_prompt_pipe(&self) -> bool {
         self.retry_prompt_pipe.is_some()
     }
@@ -370,7 +369,7 @@ fn load_prompt_from_file<P: AsRef<Path>>(path: P) -> Result<String> {
 /// # 错误
 /// - 命令执行失败（找不到命令等）
 /// - 命令返回非零退出码
-fn execute_pipe_command(command: &str) -> Result<String> {
+pub fn execute_pipe_command(command: &str) -> Result<String> {
     // 根据平台选择 shell
     #[cfg(windows)]
     let output = Command::new("cmd")

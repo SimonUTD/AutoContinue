@@ -27,6 +27,7 @@ mod runner;
 
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -144,6 +145,49 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
+/// 管道命令后台执行状态
+///
+/// 用于跟踪管道命令（-cpp/-rpp）的后台执行进度。
+/// 当管道命令需要长时间运行时（如调用 codex），使用后台线程执行，
+/// 避免阻塞主监控循环。
+enum PendingPipe {
+    /// 没有管道命令在执行
+    None,
+    /// 管道命令正在后台执行
+    Running(mpsc::Receiver<anyhow::Result<String>>),
+}
+
+/// 在后台线程中执行管道命令并提取格式
+///
+/// 该函数被后台线程调用，执行管道命令并可选地提取格式标签内容。
+///
+/// # 参数
+/// - `pipe_cmd`: 管道命令字符串
+/// - `format`: 可选的格式提取标签 (prefix, suffix)
+///
+/// # 返回值
+/// 成功返回提取后的提示词内容，失败返回错误
+fn run_pipe_command(
+    pipe_cmd: String,
+    format: Option<(String, String)>,
+) -> anyhow::Result<String> {
+    let output = config::execute_pipe_command(&pipe_cmd)?;
+    if let Some((prefix, suffix)) = format {
+        match config::extract_format(&output, &prefix, &suffix) {
+            Some(extracted) => Ok(extracted),
+            None => {
+                eprintln!(
+                    "[AC] 警告: 管道输出中未找到格式标签 {}...{}，使用完整输出",
+                    prefix, suffix
+                );
+                Ok(output)
+            }
+        }
+    } else {
+        Ok(output)
+    }
+}
+
 /// 主运行循环
 ///
 /// 该函数实现核心的无限循环逻辑：
@@ -166,6 +210,11 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
 
     // 自动继续计数器
     let mut auto_continue_count = 0u64;
+
+    // 管道命令后台执行状态
+    let mut pending_pipe = PendingPipe::None;
+    // 管道命令等待计数（每 500ms 加 1，用于定期打印状态）
+    let mut pipe_wait_count: u32 = 0;
 
     // 最大轮次限制（负数表示无限制）
     let limit = config.limit;
@@ -211,6 +260,62 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
             break;
         }
 
+        // 检查管道命令后台执行状态
+        match pending_pipe {
+            PendingPipe::None => {
+                // 没有管道在执行，继续正常检测逻辑
+            }
+            PendingPipe::Running(ref rx) => {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        // 管道命令执行完成，发送结果
+                        pending_pipe = PendingPipe::None;
+                        match result {
+                            Ok(prompt) => {
+                                println!("[AC] 管道命令执行完成");
+                                println!("[AC] 发送: {}", prompt);
+                                if let Err(e) = runner.send_line(&prompt) {
+                                    eprintln!("[AC] 发送提示词失败: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[AC] 管道命令执行失败: {}", e);
+                            }
+                        }
+                        // 重置检测器状态
+                        if let Ok(mut det) = shared_detector.lock() {
+                            det.reset();
+                        }
+                        // 检查是否达到轮次限制
+                        if limit >= 0 && auto_continue_count >= limit as u64 {
+                            println!("\n[AC] 已达到最大轮次限制 ({} 次)，停止自动发送", limit);
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // 管道命令仍在执行，定期打印状态
+                        pipe_wait_count += 1;
+                        if pipe_wait_count > 0 && pipe_wait_count % 60 == 0 {
+                            println!(
+                                "[AC] 管道命令仍在执行中... (已等待约{}秒)",
+                                pipe_wait_count / 2
+                            );
+                        }
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        eprintln!("[AC] 管道命令执行线程异常退出");
+                        pending_pipe = PendingPipe::None;
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                }
+            }
+        }
+
         // 获取当前静默时间
         let silence_duration = runner.get_silence_duration();
 
@@ -228,26 +333,42 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
             }
 
             CliStatus::Idle => {
-                // Detector 确认 CLI 空闲，发送继续 prompt
+                // Detector 确认 CLI 空闲
                 auto_continue_count += 1;
 
-                let prompt = match config.get_continue_prompt() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("[AC] 获取继续提示词失败: {}", e);
-                        thread::sleep(Duration::from_millis(500));
-                        continue;
+                if config.is_continue_prompt_pipe() {
+                    // Pipe模式：在后台线程启动管道命令，不阻塞主循环
+                    println!(
+                        "\n[AC] === [{}] 检测到空闲状态，后台启动管道命令获取第 {} 次继续提示词 ===",
+                        detector_name, auto_continue_count
+                    );
+                    let (tx, rx) = mpsc::channel();
+                    let pipe_cmd = config.continue_prompt_pipe.clone().unwrap();
+                    let cformat = config.cformat.clone();
+                    thread::spawn(move || {
+                        let result = run_pipe_command(pipe_cmd, cformat);
+                        let _ = tx.send(result);
+                    });
+                    pending_pipe = PendingPipe::Running(rx);
+                    pipe_wait_count = 0;
+                } else {
+                    // 非Pipe模式：同步获取提示词并立即发送
+                    let prompt = match config.get_continue_prompt() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("[AC] 获取继续提示词失败: {}", e);
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
+                    };
+                    println!(
+                        "\n[AC] === [{}] 检测到空闲状态，自动发送第 {} 次继续提示词 ===",
+                        detector_name, auto_continue_count
+                    );
+                    println!("[AC] 发送: {}", prompt);
+                    if let Err(e) = runner.send_line(&prompt) {
+                        eprintln!("[AC] 发送提示词失败: {}", e);
                     }
-                };
-
-                println!(
-                    "\n[AC] === [{}] 检测到空闲状态，自动发送第 {} 次继续提示词 ===",
-                    detector_name, auto_continue_count
-                );
-                println!("[AC] 发送: {}", prompt);
-
-                if let Err(e) = runner.send_line(&prompt) {
-                    eprintln!("[AC] 发送提示词失败: {}", e);
                 }
 
                 // 重置检测器状态
@@ -257,30 +378,50 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
             }
 
             CliStatus::Error { ref message } => {
-                // Detector 检测到错误，发送重试 prompt
+                // Detector 检测到错误
                 auto_continue_count += 1;
 
-                let prompt = match config.get_retry_prompt() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("[AC] 获取重试提示词失败: {}", e);
-                        thread::sleep(Duration::from_millis(500));
-                        continue;
+                if config.is_retry_prompt_pipe() {
+                    // Pipe模式：在后台线程启动管道命令
+                    println!(
+                        "\n[AC] === [{}] 检测到错误，后台启动管道命令获取第 {} 次重试提示词 ===",
+                        detector_name, auto_continue_count
+                    );
+                    if !message.is_empty() {
+                        let display_msg: String = message.chars().take(80).collect();
+                        println!("[AC] 错误信息: {}", display_msg);
                     }
-                };
-
-                println!(
-                    "\n[AC] === [{}] 检测到错误，自动发送第 {} 次重试提示词 ===",
-                    detector_name, auto_continue_count
-                );
-                if !message.is_empty() {
-                    let display_msg: String = message.chars().take(80).collect();
-                    println!("[AC] 错误信息: {}", display_msg);
-                }
-                println!("[AC] 发送: {}", prompt);
-
-                if let Err(e) = runner.send_line(&prompt) {
-                    eprintln!("[AC] 发送提示词失败: {}", e);
+                    let (tx, rx) = mpsc::channel();
+                    let pipe_cmd = config.retry_prompt_pipe.clone().unwrap();
+                    let rformat = config.rformat.clone();
+                    thread::spawn(move || {
+                        let result = run_pipe_command(pipe_cmd, rformat);
+                        let _ = tx.send(result);
+                    });
+                    pending_pipe = PendingPipe::Running(rx);
+                    pipe_wait_count = 0;
+                } else {
+                    // 非Pipe模式：同步获取提示词
+                    let prompt = match config.get_retry_prompt() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("[AC] 获取重试提示词失败: {}", e);
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
+                    };
+                    println!(
+                        "\n[AC] === [{}] 检测到错误，自动发送第 {} 次重试提示词 ===",
+                        detector_name, auto_continue_count
+                    );
+                    if !message.is_empty() {
+                        let display_msg: String = message.chars().take(80).collect();
+                        println!("[AC] 错误信息: {}", display_msg);
+                    }
+                    println!("[AC] 发送: {}", prompt);
+                    if let Err(e) = runner.send_line(&prompt) {
+                        eprintln!("[AC] 发送提示词失败: {}", e);
+                    }
                 }
 
                 // 重置检测器状态
@@ -294,24 +435,41 @@ fn run_main_loop(config: Config, exit_flag: Arc<AtomicBool>) -> Result<()> {
                 if silence_duration >= silence_threshold {
                     auto_continue_count += 1;
 
-                    let prompt = match config.get_continue_prompt() {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("[AC] 获取继续提示词失败: {}", e);
-                            thread::sleep(Duration::from_millis(500));
-                            continue;
+                    if config.is_continue_prompt_pipe() {
+                        // Pipe模式：在后台线程启动管道命令
+                        println!(
+                            "\n[AC] === 静默 {} 秒，后台启动管道命令获取第 {} 次继续提示词 (fallback) ===",
+                            silence_duration.as_secs(),
+                            auto_continue_count
+                        );
+                        let (tx, rx) = mpsc::channel();
+                        let pipe_cmd = config.continue_prompt_pipe.clone().unwrap();
+                        let cformat = config.cformat.clone();
+                        thread::spawn(move || {
+                            let result = run_pipe_command(pipe_cmd, cformat);
+                            let _ = tx.send(result);
+                        });
+                        pending_pipe = PendingPipe::Running(rx);
+                        pipe_wait_count = 0;
+                    } else {
+                        // 非Pipe模式：同步获取提示词
+                        let prompt = match config.get_continue_prompt() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("[AC] 获取继续提示词失败: {}", e);
+                                thread::sleep(Duration::from_millis(500));
+                                continue;
+                            }
+                        };
+                        println!(
+                            "\n[AC] === 静默 {} 秒，自动发送第 {} 次继续提示词 (fallback) ===",
+                            silence_duration.as_secs(),
+                            auto_continue_count
+                        );
+                        println!("[AC] 发送: {}", prompt);
+                        if let Err(e) = runner.send_line(&prompt) {
+                            eprintln!("[AC] 发送提示词失败: {}", e);
                         }
-                    };
-
-                    println!(
-                        "\n[AC] === 静默 {} 秒，自动发送第 {} 次继续提示词 (fallback) ===",
-                        silence_duration.as_secs(),
-                        auto_continue_count
-                    );
-                    println!("[AC] 发送: {}", prompt);
-
-                    if let Err(e) = runner.send_line(&prompt) {
-                        eprintln!("[AC] 发送提示词失败: {}", e);
                     }
 
                     // 重置检测器状态

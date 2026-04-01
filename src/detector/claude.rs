@@ -127,46 +127,85 @@ impl ClaudeDetector {
         }
     }
 
+    /// 将工作目录路径转换为 Claude 项目目录名
+    ///
+    /// Claude Code 使用路径分隔符替换策略：
+    /// 将路径中的 `/` 替换为 `-`，形成项目目录名。
+    /// 例如：`/Users/foo/project` → `-Users-foo-project`
+    fn cwd_to_project_dir_name(cwd: &Path) -> String {
+        cwd.to_str()
+            .map(|s| s.replace('/', "-"))
+            .unwrap_or_default()
+    }
+
     /// 扫描项目目录，找到当前工作目录对应的最新 JSONL 文件
     ///
-    /// Claude Code 使用工作目录的哈希值作为项目子目录名。
-    /// 我们无法直接计算哈希，所以扫描所有项目目录，
-    /// 找到最近修改的 `.jsonl` 文件。
+    /// 搜索策略：
+    /// 1. 优先在当前工作目录对应的项目目录中查找（精确匹配，支持多实例隔离）
+    /// 2. 如果当前项目目录不存在或没有 jsonl 文件，回退到全局搜索最新文件
     fn find_latest_session_file(&self) -> Option<PathBuf> {
-        // 如果项目目录不存在，返回 None
+        // 如果项目根目录不存在，返回 None
         if !self.projects_dir.exists() {
             return None;
         }
 
+        // 策略1：精确匹配当前工作目录的项目目录
+        let project_dir_name = Self::cwd_to_project_dir_name(&self.working_dir);
+        let specific_project_path = self.projects_dir.join(&project_dir_name);
+
+        if specific_project_path.is_dir() {
+            if let Some(file) =
+                Self::find_latest_jsonl_in_dir(&specific_project_path)
+            {
+                return Some(file);
+            }
+        }
+
+        // 策略2：回退到全局搜索（兼容旧版或异常情况）
+        Self::find_latest_jsonl_global(&self.projects_dir)
+    }
+
+    /// 在指定项目目录中查找最新的 .jsonl 文件
+    fn find_latest_jsonl_in_dir(dir: &Path) -> Option<PathBuf> {
         let mut latest_file: Option<PathBuf> = None;
         let mut latest_time = SystemTime::UNIX_EPOCH;
 
-        // 遍历所有项目子目录
-        let entries = std::fs::read_dir(&self.projects_dir).ok()?;
-        for entry in entries.flatten() {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let file_path = entry.path();
+            if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            if let Ok(metadata) = file_path.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    if modified > latest_time {
+                        latest_time = modified;
+                        latest_file = Some(file_path);
+                    }
+                }
+            }
+        }
+
+        latest_file
+    }
+
+    /// 全局搜索所有项目目录中最新的 .jsonl 文件
+    fn find_latest_jsonl_global(projects_dir: &Path) -> Option<PathBuf> {
+        let mut latest_file: Option<PathBuf> = None;
+        let mut latest_time = SystemTime::UNIX_EPOCH;
+
+        for entry in std::fs::read_dir(projects_dir).ok()?.flatten() {
             let project_path = entry.path();
             if !project_path.is_dir() {
                 continue;
             }
 
-            // 在项目目录中查找 .jsonl 文件
-            let sub_entries = match std::fs::read_dir(&project_path) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            for sub_entry in sub_entries.flatten() {
-                let file_path = sub_entry.path();
-                if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
-
-                // 比较修改时间，找最新的
-                if let Ok(metadata) = file_path.metadata() {
+            if let Some(file) = Self::find_latest_jsonl_in_dir(&project_path) {
+                if let Ok(metadata) = file.metadata() {
                     if let Ok(modified) = metadata.modified() {
                         if modified > latest_time {
                             latest_time = modified;
-                            latest_file = Some(file_path);
+                            latest_file = Some(file);
                         }
                     }
                 }
