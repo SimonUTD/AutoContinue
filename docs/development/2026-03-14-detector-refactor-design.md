@@ -186,3 +186,31 @@ loop {
 5. 更新 `Cargo.toml` 依赖
 6. 全面测试
 7. 更新文档
+
+## 7. 后续扩展：Prompt Pipe 提示词管道（v0.2.0+）
+
+### 7.1 背景
+
+静态提示词在复杂场景下不够灵活。需要一种机制让提示词在每次使用时动态生成，
+典型场景是让另一个 AI CLI 分析当前项目状态并生成下一步建议。
+
+### 7.2 新增参数
+
+| 参数 | 说明 |
+|------|------|
+| `-cpp, --continue-prompt-pipe` | 继续提示词管道命令（每次执行） |
+| `-rpp, --retry-prompt-pipe` | 重试提示词管道命令（每次执行） |
+| `--cformat <前缀> <后缀>` | 从继续管道输出中提取最后一组标签包裹内容 |
+| `--rformat <前缀> <后缀>` | 从重试管道输出中提取最后一组标签包裹内容 |
+
+### 7.3 核心实现
+
+- `execute_pipe_command()`: 跨平台执行 shell 命令（Windows: `cmd /C`, Unix: `sh -c`）
+- `extract_format()`: 从输出中 rfind 最后一个 prefix，再 find suffix，提取中间内容
+- 提示词优先级：pipe > io > file > direct > default
+
+### 7.4 互斥关系
+
+- `-cpp` 与 `-cp, -cpf, -cpio` 互斥
+- `-rpp` 与 `-rp, -rpf, -rpio` 互斥
+- `--cformat` / `--rformat` 仅在对应 pipe 模式下生效

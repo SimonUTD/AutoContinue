@@ -7,11 +7,16 @@
 //! - `-cp, --continue-prompt`: 继续的提示词
 //! - `-cpf, --continue-prompt-file`: 继续的提示词文件（启动时读取一次）
 //! - `-cpio, --continue-prompt-io`: 继续的提示词IO文件（每次使用时重新读取）
+//! - `-cpp, --continue-prompt-pipe`: 继续的提示词管道命令（每次执行命令获取）
 //! - `-rp, --retry-prompt`: 重试的提示词
 //! - `-rpf, --retry-prompt-file`: 重试的提示词文件（启动时读取一次）
 //! - `-rpio, --retry-prompt-io`: 重试的提示词IO文件（每次使用时重新读取）
+//! - `-rpp, --retry-prompt-pipe`: 重试的提示词管道命令（每次执行命令获取）
+//! - `--cformat <前缀> <后缀>`: 继续管道输出格式提取
+//! - `--rformat <前缀> <后缀>`: 重试管道输出格式提取
 //! - `-st, --sleep-time`: 等待时间（秒），默认15秒
 //! - `-sth, --silence-threshold`: 静默阈值（秒），默认30秒
+//! - `-l, --limit`: 最大轮次限制，默认-1（无限制）
 //! - `-h, --help`: 显示帮助信息
 //! - `-v, --version`: 显示版本信息
 //!
@@ -20,6 +25,7 @@
 //! ac claude --resume -cp "继续迭代" -rp "重试"
 //! ac -cp "继续" claude --resume    # AC参数在前也可以
 //! ac claude -cpio prompt.md        # 使用IO文件，可动态修改
+//! ac claude -cpp "echo 继续开发"   # 使用管道命令动态获取提示词
 //! ```
 
 use clap::Parser;
@@ -34,25 +40,25 @@ const AC_ARGS_WITH_VALUE: &[&str] = &[
     "--cp",
     "--continue-prompt",
     // continue-prompt-file
-    "-cpf",
-    "--cpf",
-    "--continue-prompt-file",
-    // continue-prompt-io (新增)
-    "-cpio",
-    "--cpio",
-    "--continue-prompt-io",
+    "-cpf", "--cpf", "--continue-prompt-file",
+    // continue-prompt-io
+    "-cpio", "--cpio", "--continue-prompt-io",
+    // continue-prompt-pipe (管道命令)
+    "-cpp", "--cpp", "--continue-prompt-pipe",
     // retry-prompt
     "-rp",
     "--rp",
     "--retry-prompt",
     // retry-prompt-file
-    "-rpf",
-    "--rpf",
-    "--retry-prompt-file",
-    // retry-prompt-io (新增)
-    "-rpio",
-    "--rpio",
-    "--retry-prompt-io",
+    "-rpf", "--rpf", "--retry-prompt-file",
+    // retry-prompt-io
+    "-rpio", "--rpio", "--retry-prompt-io",
+    // retry-prompt-pipe (管道命令)
+    "-rpp", "--rpp", "--retry-prompt-pipe",
+    // cformat (继续管道格式提取，取2个值)
+    "--cformat",
+    // rformat (重试管道格式提取，取2个值)
+    "--rformat",
     // sleep-time
     "-st",
     "--st",
@@ -70,11 +76,16 @@ const AC_ARGS_WITH_VALUE: &[&str] = &[
 /// AC参数名称列表（不带值的参数）
 const AC_ARGS_NO_VALUE: &[&str] = &["-h", "--help", "-v", "--version", "-V"];
 
+/// AC参数名称列表（带2个值的参数）
+/// 这些参数会连续消费2个值
+const AC_ARGS_WITH_TWO_VALUES: &[&str] = &[
+    "--cformat",
+    "--rformat",
+];
+
 /// AC特有的短参数列表（需要转换为双横线格式）
 /// 这些参数支持单横线格式（如 -cp）但会被转换为双横线格式（如 --cp）
-const AC_SHORT_ARGS: &[&str] = &[
-    "-cp", "-cpf", "-cpio", "-rp", "-rpf", "-rpio", "-st", "-sth", "-l",
-];
+const AC_SHORT_ARGS: &[&str] = &["-cp", "-cpf", "-cpio", "-cpp", "-rp", "-rpf", "-rpio", "-rpp", "-st", "-sth", "-l"];
 
 /// AutoContinue (AC) - 自动继续/重试CLI工具的包装器
 ///
@@ -105,9 +116,15 @@ pub struct Args {
 
     /// 继续的提示词IO文件路径，每次使用时重新读取文件
     /// 允许在程序运行时动态修改提示词内容
-    /// 与 -cp, -cpf 互斥
+    /// 与 -cp, -cpf, -cpp 互斥
     #[arg(long = "continue-prompt-io", visible_alias = "cpio", value_name = "FILE", conflicts_with_all = ["continue_prompt", "continue_prompt_file"])]
     pub continue_prompt_io: Option<String>,
+
+    /// 继续的提示词管道命令，每次使用时执行命令获取提示词
+    /// 命令的 stdout 输出将作为提示词内容
+    /// 与 -cp, -cpf, -cpio 互斥
+    #[arg(long = "continue-prompt-pipe", visible_alias = "cpp", value_name = "COMMAND", conflicts_with_all = ["continue_prompt", "continue_prompt_file", "continue_prompt_io"])]
+    pub continue_prompt_pipe: Option<String>,
 
     /// 重试的提示词，当CLI出错时发送
     /// 与 -rpf, -rpio 互斥
@@ -126,9 +143,29 @@ pub struct Args {
 
     /// 重试的提示词IO文件路径，每次使用时重新读取文件
     /// 允许在程序运行时动态修改提示词内容
-    /// 与 -rp, -rpf 互斥
+    /// 与 -rp, -rpf, -rpp 互斥
     #[arg(long = "retry-prompt-io", visible_alias = "rpio", value_name = "FILE", conflicts_with_all = ["retry_prompt", "retry_prompt_file"])]
     pub retry_prompt_io: Option<String>,
+
+    /// 重试的提示词管道命令，每次使用时执行命令获取提示词
+    /// 命令的 stdout 输出将作为提示词内容
+    /// 与 -rp, -rpf, -rpio 互斥
+    #[arg(long = "retry-prompt-pipe", visible_alias = "rpp", value_name = "COMMAND", conflicts_with_all = ["retry_prompt", "retry_prompt_file", "retry_prompt_io"])]
+    pub retry_prompt_pipe: Option<String>,
+
+    /// 继续管道输出格式提取标签
+    /// 指定前缀和后缀，从管道输出中提取最后一组匹配内容
+    /// 例如：--cformat "<continue>" "</continue>"
+    /// 仅在 -cpp 存在时生效
+    #[arg(long = "cformat", value_names = ["PREFIX", "SUFFIX"], num_args = 2)]
+    pub cformat: Option<Vec<String>>,
+
+    /// 重试管道输出格式提取标签
+    /// 指定前缀和后缀，从管道输出中提取最后一组匹配内容
+    /// 例如：--rformat "<retry>" "</retry>"
+    /// 仅在 -rpp 存在时生效
+    #[arg(long = "rformat", value_names = ["PREFIX", "SUFFIX"], num_args = 2)]
+    pub rformat: Option<Vec<String>>,
 
     /// 等待时间（秒），用于给用户自主回复的时间
     /// 超过该时间则自动继续，默认15秒
@@ -188,7 +225,7 @@ pub fn parse_args() -> Args {
     Args::parse_from(processed_args)
 }
 
-/// 检查参数是否是AC的带值参数
+/// 检查参数是否是AC的带值参数（消费1个值）
 ///
 /// # 参数
 /// - `arg`: 要检查的参数
@@ -196,7 +233,19 @@ pub fn parse_args() -> Args {
 /// # 返回值
 /// 如果是AC带值参数返回true
 fn is_ac_arg_with_value(arg: &str) -> bool {
-    AC_ARGS_WITH_VALUE.contains(&arg)
+    // 双值参数不在此列，由 is_ac_arg_with_two_values 处理
+    AC_ARGS_WITH_VALUE.contains(&arg) && !AC_ARGS_WITH_TWO_VALUES.contains(&arg)
+}
+
+/// 检查参数是否是AC的双值参数（消费2个值）
+///
+/// # 参数
+/// - `arg`: 要检查的参数
+///
+/// # 返回值
+/// 如果是AC双值参数返回true
+fn is_ac_arg_with_two_values(arg: &str) -> bool {
+    AC_ARGS_WITH_TWO_VALUES.contains(&arg)
 }
 
 /// 检查参数是否是AC的无值参数
@@ -256,7 +305,16 @@ fn separate_and_reorder_args(args: Vec<String>) -> Vec<String> {
 
     // 遍历剩余参数
     while let Some(arg) = iter.next() {
-        if is_ac_arg_with_value(&arg) {
+        if is_ac_arg_with_two_values(&arg) {
+            // AC双值参数：保存参数名和连续2个值
+            ac_args.push(convert_short_arg(&arg));
+            if let Some(value1) = iter.next() {
+                ac_args.push(value1);
+            }
+            if let Some(value2) = iter.next() {
+                ac_args.push(value2);
+            }
+        } else if is_ac_arg_with_value(&arg) {
             // AC带值参数：保存参数名和下一个值
             ac_args.push(convert_short_arg(&arg));
             if let Some(value) = iter.next() {
@@ -433,6 +491,68 @@ mod tests {
         let args = parse_args_from(["ac", "-l", "3", "claude", "--resume"]);
         assert_eq!(args.cli, "claude");
         assert_eq!(args.limit, 3);
+        assert!(args.cli_args.iter().any(|a| a == "--resume"));
+    }
+
+    /// 测试 -cpp 管道参数解析
+    #[test]
+    fn test_pipe_continue_prompt() {
+        let args = parse_args_from(["ac", "claude", "-cpp", "echo 继续"]);
+        assert_eq!(args.cli, "claude");
+        assert_eq!(args.continue_prompt_pipe, Some("echo 继续".to_string()));
+    }
+
+    /// 测试 -rpp 管道参数解析
+    #[test]
+    fn test_pipe_retry_prompt() {
+        let args = parse_args_from(["ac", "claude", "-rpp", "echo 重试"]);
+        assert_eq!(args.retry_prompt_pipe, Some("echo 重试".to_string()));
+    }
+
+    /// 测试 -cpp 放在 CLI 名称之前
+    #[test]
+    fn test_pipe_before_cli() {
+        let args = parse_args_from(["ac", "-cpp", "cat prompt.txt", "claude", "--resume"]);
+        assert_eq!(args.cli, "claude");
+        assert_eq!(args.continue_prompt_pipe, Some("cat prompt.txt".to_string()));
+        assert!(args.cli_args.iter().any(|a| a == "--resume"));
+    }
+
+    /// 测试 --cformat 双值参数解析
+    #[test]
+    fn test_cformat_parsing() {
+        let args = parse_args_from([
+            "ac", "claude", "-cpp", "echo test", "--cformat", "<continue>", "</continue>"
+        ]);
+        assert_eq!(args.continue_prompt_pipe, Some("echo test".to_string()));
+        let cformat = args.cformat.unwrap();
+        assert_eq!(cformat[0], "<continue>");
+        assert_eq!(cformat[1], "</continue>");
+    }
+
+    /// 测试 --rformat 双值参数解析
+    #[test]
+    fn test_rformat_parsing() {
+        let args = parse_args_from([
+            "ac", "claude", "-rpp", "echo err", "--rformat", "<retry>", "</retry>"
+        ]);
+        assert_eq!(args.retry_prompt_pipe, Some("echo err".to_string()));
+        let rformat = args.rformat.unwrap();
+        assert_eq!(rformat[0], "<retry>");
+        assert_eq!(rformat[1], "</retry>");
+    }
+
+    /// 测试 --cformat 在混合参数中正确提取
+    #[test]
+    fn test_cformat_mixed_with_cli_args() {
+        let args = parse_args_from([
+            "ac", "-cpp", "echo test", "--cformat", "<c>", "</c>", "claude", "--resume"
+        ]);
+        assert_eq!(args.cli, "claude");
+        assert_eq!(args.continue_prompt_pipe, Some("echo test".to_string()));
+        let cformat = args.cformat.unwrap();
+        assert_eq!(cformat[0], "<c>");
+        assert_eq!(cformat[1], "</c>");
         assert!(args.cli_args.iter().any(|a| a == "--resume"));
     }
 }

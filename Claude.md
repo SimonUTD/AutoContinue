@@ -37,9 +37,13 @@ ac claude -cpio prompt.md
 | `-cp, --continue-prompt` | 继续提示词 | "继续" |
 | `-cpf, --continue-prompt-file` | 继续提示词文件 | - |
 | `-cpio, --continue-prompt-io` | 继续提示词IO文件（动态读取） | - |
+| `-cpp, --continue-prompt-pipe` | 继续提示词管道命令（每次执行） | - |
 | `-rp, --retry-prompt` | 重试提示词 | "重试" |
 | `-rpf, --retry-prompt-file` | 重试提示词文件 | - |
 | `-rpio, --retry-prompt-io` | 重试提示词IO文件（动态读取） | - |
+| `-rpp, --retry-prompt-pipe` | 重试提示词管道命令（每次执行） | - |
+| `--cformat <前缀> <后缀>` | 继续管道输出格式提取（取最后一组匹配） | - |
+| `--rformat <前缀> <后缀>` | 重试管道输出格式提取（取最后一组匹配） | - |
 | `-st, --sleep-time` | 额外等待时间（秒） | 15 |
 | `-sth, --silence-threshold` | 静默阈值（秒） | 30 |
 | `-l, --limit` | 最大自动发送轮次（-1为无限制） | -1 |
